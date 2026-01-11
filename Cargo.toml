@@ -1,0 +1,69 @@
+[package]
+name = "coldstore"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "S3-compatible tape-based cold storage archive system"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/coldstore"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# HTTP server and S3 compatibility
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+http = "1.0"
+hyper = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Database and metadata storage
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
+# etcd-rs = "1.0"  # 暂时注释，等需要时再添加
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging and observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Configuration
+config = "0.14"
+
+# Time and date
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Checksum and hashing
+sha2 = "0.10"
+crc32fast = "1.3"
+
+# Cache
+lru = "0.12"
+
+# Tape and storage
+# Note: These may need to be replaced with actual tape library bindings
+# For now, we'll use placeholder dependencies
+
+# Message queue and notifications
+# rabbitmq-stream-client = "0.12"  # Optional: for MQ integration
+
+# Metrics (optional)
+# prometheus = "0.13"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.12"
+
+[[bin]]
+name = "coldstore"
+path = "src/main.rs"

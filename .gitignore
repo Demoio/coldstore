@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config
+config/config.yaml
+!config/config.yaml.example
+
+# Logs
+*.log
+logs/
+
+# Cache
+/var/cache/coldstore/
+
+# Test data
+test_data/

@@ -1,0 +1,46 @@
+server:
+  host: "0.0.0.0"
+  port: 9000
+  s3_endpoint: "http://localhost:9000"
+
+metadata:
+  backend: "Postgres"  # 或 "Etcd"
+  postgres:
+    url: "postgresql://localhost/coldstore"
+    max_connections: 10
+  etcd:
+    endpoints:
+      - "http://localhost:2379"
+    timeout_secs: 5
+
+scheduler:
+  archive:
+    scan_interval_secs: 3600  # 1小时扫描一次
+    batch_size: 1000
+    min_archive_size_mb: 100
+    target_throughput_mbps: 300  # 目标 300 MB/s
+  recall:
+    queue_size: 10000
+    max_concurrent_restores: 10
+    restore_timeout_secs: 3600
+    min_restore_interval_secs: 300  # 5分钟
+
+cache:
+  enabled: true
+  path: "/var/cache/coldstore"
+  max_size_gb: 100
+  ttl_secs: 86400  # 24小时
+  eviction_policy: "Lru"  # 或 "Lfu", "Ttl"
+
+tape:
+  library_path: null  # 磁带库路径，根据实际情况配置
+  supported_formats:
+    - "LTO-9"
+    - "LTO-10"
+  replication_factor: 2
+  verify_readability: true
+
+notification:
+  enabled: true
+  webhook_url: null  # Webhook URL，可选
+  mq_endpoint: null  # 消息队列端点，可选
