@@ -26,7 +26,7 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                     浏览器 (Admin Console)                        │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Vue 3 / React + TypeScript + Ant Design / Element Plus   │  │
+│  │  React 18 + TypeScript + Ant Design 5                     │  │
 │  └──────────────────────────┬────────────────────────────────┘  │
 └─────────────────────────────┼───────────────────────────────────┘
                               │ HTTP/JSON
@@ -64,13 +64,13 @@
 
 | 组件 | 选型 | 说明 |
 |------|------|------|
-| 框架 | **Vue 3 + TypeScript** | 组合式 API、类型安全 |
-| UI 库 | **Ant Design Vue** | 企业级管控面组件（Table、Form、Chart） |
-| 图表 | **ECharts** | 仪表板图表 |
+| 框架 | **React 18 + TypeScript** | Hooks 函数组件、类型安全 |
+| UI 库 | **Ant Design 5** | 企业级管控面组件（Table、Form、Chart） |
+| 图表 | **ECharts** (`echarts-for-react`) | 仪表板图表 |
 | HTTP | **Axios** | API 调用 |
-| 状态管理 | **Pinia** | 全局状态 |
-| 路由 | **Vue Router** | SPA 路由 |
-| 构建 | **Vite** | 快速构建 |
+| 状态管理 | **Zustand** | 轻量全局状态 |
+| 路由 | **React Router 6** | SPA 路由 |
+| 构建 | **Vite** (`@vitejs/plugin-react`) | 快速构建 |
 
 ---
 
@@ -943,10 +943,9 @@ console/
 ├── vite.config.ts
 ├── tsconfig.json
 ├── src/
-│   ├── main.ts
-│   ├── App.vue
-│   ├── router/
-│   │   └── index.ts           # 路由定义
+│   ├── main.tsx
+│   ├── App.tsx
+│   ├── routes.tsx             # React Router 路由定义
 │   ├── api/                   # API 封装
 │   │   ├── client.ts          # Axios 实例（含 JWT 拦截器）
 │   │   ├── cluster.ts
@@ -959,42 +958,45 @@ console/
 │   │   ├── metrics.ts
 │   │   ├── alert.ts
 │   │   └── auth.ts
-│   ├── stores/                # Pinia 状态
-│   │   ├── auth.ts
-│   │   ├── websocket.ts       # WS 连接 + 事件分发
-│   │   └── notification.ts
-│   ├── views/                 # 页面组件
-│   │   ├── Dashboard.vue
+│   ├── stores/                # Zustand 状态
+│   │   ├── useAuthStore.ts
+│   │   ├── useWebSocketStore.ts   # WS 连接 + 事件分发
+│   │   └── useNotificationStore.ts
+│   ├── pages/                 # 页面组件
+│   │   ├── Dashboard.tsx
 │   │   ├── cluster/
-│   │   │   ├── Overview.vue
-│   │   │   └── NodeDetail.vue
+│   │   │   ├── Overview.tsx
+│   │   │   └── NodeDetail.tsx
 │   │   ├── storage/
-│   │   │   ├── BucketList.vue
-│   │   │   ├── BucketDetail.vue
-│   │   │   └── ObjectQuery.vue
+│   │   │   ├── BucketList.tsx
+│   │   │   ├── BucketDetail.tsx
+│   │   │   └── ObjectQuery.tsx
 │   │   ├── tape/
-│   │   │   ├── TapeList.vue
-│   │   │   ├── TapeDetail.vue
-│   │   │   ├── DriveList.vue
-│   │   │   └── OfflineRequests.vue
+│   │   │   ├── TapeList.tsx
+│   │   │   ├── TapeDetail.tsx
+│   │   │   ├── DriveList.tsx
+│   │   │   └── OfflineRequests.tsx
 │   │   ├── task/
-│   │   │   ├── ArchiveTaskList.vue
-│   │   │   └── RecallTaskList.vue
+│   │   │   ├── ArchiveTaskList.tsx
+│   │   │   └── RecallTaskList.tsx
 │   │   ├── cache/
-│   │   │   └── CacheOverview.vue
+│   │   │   └── CacheOverview.tsx
 │   │   ├── monitor/
-│   │   │   ├── Metrics.vue
-│   │   │   └── Alerts.vue
+│   │   │   ├── Metrics.tsx
+│   │   │   └── Alerts.tsx
 │   │   └── settings/
-│   │       ├── Config.vue
-│   │       ├── UserManage.vue
-│   │       └── AuditLog.vue
+│   │       ├── Config.tsx
+│   │       ├── UserManage.tsx
+│   │       └── AuditLog.tsx
 │   ├── components/            # 通用组件
-│   │   ├── StatusTag.vue      # 状态标签（颜色映射）
-│   │   ├── CapacityBar.vue    # 容量条
-│   │   ├── DriveCard.vue      # 驱动卡片
-│   │   ├── EventTimeline.vue  # 事件时间线
-│   │   └── ConfirmDialog.vue  # 二次确认弹窗
+│   │   ├── StatusTag.tsx      # 状态标签（颜色映射）
+│   │   ├── CapacityBar.tsx    # 容量条
+│   │   ├── DriveCard.tsx      # 驱动卡片
+│   │   ├── EventTimeline.tsx  # 事件时间线
+│   │   └── ConfirmDialog.tsx  # 二次确认弹窗
+│   ├── hooks/                 # 自定义 Hooks
+│   │   ├── usePolling.ts      # 轮询数据刷新
+│   │   └── useWebSocket.ts    # WS 连接 Hook
 │   └── utils/
 │       ├── format.ts          # 字节/时间格式化
 │       └── constants.ts       # 枚举映射
@@ -1049,6 +1051,8 @@ admin:
 - [Axum](https://docs.rs/axum/latest/axum/) — HTTP 框架
 - [utoipa](https://docs.rs/utoipa/latest/utoipa/) — OpenAPI 文档生成
 - [jsonwebtoken](https://docs.rs/jsonwebtoken) — JWT 实现
-- [Vue 3](https://vuejs.org/) — 前端框架
-- [Ant Design Vue](https://antdv.com/) — UI 组件库
+- [React 18](https://react.dev/) — 前端框架
+- [Ant Design 5](https://ant.design/) — UI 组件库
+- [Zustand](https://zustand-demo.pmnd.rs/) — 状态管理
+- [React Router 6](https://reactrouter.com/) — 路由
 - [ECharts](https://echarts.apache.org/) — 图表库
