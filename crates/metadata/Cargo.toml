@@ -1,0 +1,29 @@
+[package]
+name = "coldstore-metadata"
+description = "ColdStore metadata cluster node (Raft + RocksDB)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "coldstore-metadata"
+path = "src/main.rs"
+
+[dependencies]
+coldstore-proto = { workspace = true }
+coldstore-common = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+config = { workspace = true }
+
+# TODO: Phase 2 - Raft + RocksDB
+# openraft = "0.10"
+# rocksdb = "0.22"

@@ -1,0 +1,226 @@
+syntax = "proto3";
+package coldstore.cache;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// ===========================================================================
+//  CacheService — Scheduler Worker → Cache Worker 接口
+//
+//  Cache Worker 是独立二进制，通过 gRPC 与 Scheduler 通信。
+//  缓存层是纯数据存储，不持有 MetadataClient。
+//
+//  职责:
+//    - 暂存 PutObject 写入的数据（等待归档）
+//    - 存储解冻后的对象数据（供 GET 快速响应）
+//    - 缓存淘汰（LRU/LFU/TTL/容量）
+//
+//  当前后端: 机械硬盘 (HDD)
+//  目标后端: SPDK Blobstore (NVMe)
+// ===========================================================================
+service CacheService {
+
+  // ── 写入接口 (CacheWriteApi) ──
+
+  // 暂存 PutObject 数据（写入即 ColdPending，等待归档调度器消费）
+  // client streaming: 第一个 chunk 携带元数据，后续为数据块
+  rpc PutStaging(stream PutStagingRequest) returns (PutStagingResponse);
+
+  // 写入解冻数据（从磁带取回后写入缓存）
+  // client streaming: 第一个 chunk 携带元数据，后续为数据块
+  rpc PutRestored(stream PutRestoredRequest) returns (google.protobuf.Empty);
+
+  // 删除缓存对象
+  rpc Delete(DeleteRequest) returns (google.protobuf.Empty);
+
+  // ── 读取接口 (CacheReadApi) ──
+
+  // 读取缓存对象数据
+  // server streaming: 第一个 chunk 携带元数据，后续为数据块
+  rpc Get(GetRequest) returns (stream GetResponse);
+
+  // 检查缓存对象是否存在且未过期
+  rpc Contains(ContainsRequest) returns (ContainsResponse);
+
+  // 读取暂存数据（归档调度器消费）
+  // server streaming: 第一个 chunk 携带元数据，后续为数据块
+  rpc GetStaging(GetStagingRequest) returns (stream GetStagingResponse);
+
+  // 列出所有暂存对象的 key（归档调度器扫描用）
+  rpc ListStagingKeys(ListStagingKeysRequest) returns (ListStagingKeysResponse);
+
+  // 删除暂存数据（归档写入磁带成功后清理）
+  rpc DeleteStaging(DeleteStagingRequest) returns (google.protobuf.Empty);
+
+  // ── 管理接口 ──
+
+  // 获取缓存统计信息
+  rpc Stats(google.protobuf.Empty) returns (CacheStats);
+}
+
+// ---------------------------------------------------------------------------
+//  PutStaging (client streaming) — 暂存 PutObject 数据
+// ---------------------------------------------------------------------------
+
+message PutStagingRequest {
+  oneof payload {
+    PutStagingMeta meta = 1;
+    bytes data = 2;
+  }
+}
+
+message PutStagingMeta {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+  uint64 size = 4;
+  optional string checksum = 5;
+  optional string content_type = 6;
+  optional string etag = 7;
+}
+
+message PutStagingResponse {
+  string staging_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+//  PutRestored (client streaming) — 写入解冻数据
+// ---------------------------------------------------------------------------
+
+message PutRestoredRequest {
+  oneof payload {
+    PutRestoredMeta meta = 1;
+    bytes data = 2;
+  }
+}
+
+message PutRestoredMeta {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+  uint64 size = 4;
+  optional string checksum = 5;
+  optional string content_type = 6;
+  optional string etag = 7;
+  google.protobuf.Timestamp expire_at = 8;
+}
+
+// ---------------------------------------------------------------------------
+//  Get (server streaming) — 读取缓存对象
+// ---------------------------------------------------------------------------
+
+message GetRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+}
+
+message GetResponse {
+  oneof payload {
+    CachedObjectMeta meta = 1;
+    bytes data = 2;
+  }
+}
+
+message CachedObjectMeta {
+  uint64 size = 1;
+  google.protobuf.Timestamp expire_at = 2;
+  optional string content_type = 3;
+  optional string etag = 4;
+  optional string checksum = 5;
+}
+
+// ---------------------------------------------------------------------------
+//  Contains — 检查缓存是否命中
+// ---------------------------------------------------------------------------
+
+message ContainsRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+}
+
+message ContainsResponse {
+  bool exists = 1;
+  optional google.protobuf.Timestamp expire_at = 2;
+}
+
+// ---------------------------------------------------------------------------
+//  Delete — 删除缓存对象
+// ---------------------------------------------------------------------------
+
+message DeleteRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+}
+
+// ---------------------------------------------------------------------------
+//  Staging 操作 — 归档调度器使用
+// ---------------------------------------------------------------------------
+
+message GetStagingRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+}
+
+message GetStagingResponse {
+  oneof payload {
+    StagingObjectMeta meta = 1;
+    bytes data = 2;
+  }
+}
+
+message StagingObjectMeta {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+  uint64 size = 4;
+  optional string checksum = 5;
+  optional string content_type = 6;
+  optional string etag = 7;
+  google.protobuf.Timestamp staged_at = 8;
+}
+
+message ListStagingKeysRequest {
+  uint32 limit = 1;
+  optional string after = 2;
+}
+
+message ListStagingKeysResponse {
+  repeated StagingKeyEntry entries = 1;
+  bool has_more = 2;
+}
+
+message StagingKeyEntry {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+  uint64 size = 4;
+  google.protobuf.Timestamp staged_at = 5;
+}
+
+message DeleteStagingRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+}
+
+// ---------------------------------------------------------------------------
+//  Stats — 缓存统计
+// ---------------------------------------------------------------------------
+
+message CacheStats {
+  uint64 total_capacity = 1;
+  uint64 used_capacity = 2;
+  uint64 object_count = 3;
+  uint64 staging_count = 4;
+  uint64 staging_bytes = 5;
+  uint64 restored_count = 6;
+  uint64 restored_bytes = 7;
+  uint64 hit_count = 8;
+  uint64 miss_count = 9;
+  uint64 evict_count = 10;
+  uint64 evict_bytes = 11;
+}

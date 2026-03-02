@@ -6,7 +6,7 @@
 
 本项目目标是构建一个：
 
-> S3 协议兼容、支持磁带归档、具备自动冷热分层与解冻能力的冷存储系统
+> S3 协议兼容、支持磁带归档的纯冷归档系统，具备解冻能力
 
 
 
@@ -19,7 +19,7 @@
 
 对上层应用保持 S3 协议透明，无需业务改造
 
-支持对象数据自动流转至磁带等冷存储介质
+所有 PutObject 写入立即排队归档至磁带
 
 提供可控、可观测、可扩展的解冻与回迁能力
 
@@ -47,14 +47,7 @@
 
 3.2 冷数据自动分层与归档
 
-支持基于策略将对象数据从通用存储介质自动迁移至冷存储介质：
-
-生命周期规则（时间维度）
-
-访问频率（冷热识别）
-
-对象标签 / Bucket 级策略
-
+所有通过 PutObject 写入的对象立即标记为 ColdPending 并排队等待归档至磁带。ColdStore 不管理生命周期策略——何时归档由外部热存储系统决定。
 
 冷数据归档后，对象元数据仍保持可见；
 
@@ -195,7 +188,7 @@ TTL 失效策略
 
 S3 接入层：对外提供对象访问接口
 
-元数据与策略管理层：管理冷热状态、生命周期与索引
+元数据与策略管理层：管理冷状态与索引
 
 冷热调度层：归档与取回调度核心
 
@@ -217,12 +210,12 @@ S3 接入层
 
 对冷对象访问进行拦截与状态判断；
 
-可基于 MinIO / 自研 S3 Proxy 实现。
+基于自研 Axum S3 网关实现。
 
 
 元数据服务
 
-维护对象冷热状态、归档位置、磁带索引；
+维护对象冷状态、归档位置、磁带索引；
 
 支持一致性校验与状态机管理；
 
@@ -231,7 +224,7 @@ S3 接入层
 
 归档调度器（Archive Scheduler）
 
-扫描满足归档条件的对象；
+处理排队等待归档的 ColdPending 对象；
 
 进行批量聚合与顺序写入；
 
@@ -272,16 +265,16 @@ S3 接入层
 
 5.1 冷数据归档流程
 
-1. 对象写入 S3；
+1. 对象通过 S3（PutObject）写入；
 
 
-2. 生命周期策略命中；
+2. 对象立即标记为 ColdPending 并排队等待归档；
 
 
 3. 调度器聚合对象并写入磁带；
 
 
-4. 更新元数据冷热状态；
+4. 更新元数据冷状态（ColdPending → Cold）；
 
 
 5. 释放在线存储空间。
@@ -334,10 +327,10 @@ S3 接入层
 
 层级    技术选型    说明
 
-S3 接入层    MinIO / RustFS    提供 S3 兼容接口，承载 PUT/GET/HEAD/Restore 语义
-元数据存储    KV / RDB（如 etcd / PostgreSQL）    管理冷热状态、磁带索引、任务状态
+S3 接入层    Axum（自研 S3 网关）    提供 S3 兼容接口，承载 PUT/GET/HEAD/Restore 语义
+元数据存储    OpenRaft + RocksDB    管理冷状态、磁带索引、任务状态
 冷热调度    自研 Scheduler（Rust）    归档与取回核心逻辑，强业务定制
-缓存层    本地 HDD / SSD + LRU    解冻数据缓存，避免重复取带
+缓存层    SPDK Blobstore (NVMe) / HDD    解冻数据缓存，避免重复取带
 磁带访问    LTFS / 厂商 SDK / SCSI    对接 LTO-9 / LTO-10 磁带库
 通知系统    Webhook / MQ / 工单系统    离线磁带人工协同
 
@@ -362,14 +355,7 @@ RestoreObject 或扩展 API：
 
 
 
-该逻辑可通过：
-
-MinIO 的 Lifecycle / ILM 扩展
-
-或在 RustFS 的对象访问路径中直接注入判断
-
-
-实现。
+ColdStore 为纯冷归档系统：所有 PutObject 写入立即进入 ColdPending 状态，无 Hot/Warm 存储。
 
 
 ---
@@ -382,7 +368,7 @@ MinIO 的 Lifecycle / ILM 扩展
 
 bucket / object / version
 
-storage_class：HOT / WARM / COLD
+storage_class：ColdPending / Cold
 
 archive_id（归档包 ID）
 
@@ -414,13 +400,13 @@ restore_status / restore_expire_at
 
 写入路径
 
-1. 对象正常写入 MinIO / RustFS；
+1. 对象通过 PutObject 写入；
 
 
-2. 生命周期策略命中，标记为 COLD_PENDING；
+2. 立即标记为 ColdPending 并排队等待归档；
 
 
-3. Archive Scheduler 扫描并聚合对象；
+3. Archive Scheduler 聚合对象；
 
 
 4. 顺序写入磁带（Streaming Write ≥ 300MB/s）；
@@ -549,9 +535,9 @@ Archive / Recall Scheduler    业务策略强，通用方案无法覆盖
 
 7.10 可复用与可替换组件
 
-S3：MinIO / RustFS
+S3：自研 Axum 网关
 
-KV：etcd / PostgreSQL
+元数据：OpenRaft + RocksDB
 
 通知：现有工单 / 告警系统
 

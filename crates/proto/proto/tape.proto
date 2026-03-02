@@ -1,0 +1,197 @@
+syntax = "proto3";
+package coldstore.tape;
+
+import "common.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// ===========================================================================
+//  TapeService — Scheduler Worker → Tape Worker 接口
+//
+//  Tape Worker 独立部署于挂载磁带驱动和带库的物理节点上。
+//  通过 gRPC 接收 Scheduler 的读写指令。
+//  纯硬件抽象层，不持有 MetadataClient。
+// ===========================================================================
+service TapeService {
+
+  // ── 数据读写 ──
+
+  // 写入归档包到磁带（顺序写入）
+  // client streaming: 第一个 chunk 携带写入元数据，后续为数据块
+  // 返回写入结果（filemark 位置、校验和等）
+  rpc WriteBundle(stream WriteBundleRequest) returns (WriteBundleResponse);
+
+  // 从磁带读取归档包（或单个对象）
+  // 返回 server streaming 数据
+  rpc ReadBundle(ReadBundleRequest) returns (stream ReadBundleResponse);
+
+  // ── 驱动管理 ──
+
+  // 列出所有磁带驱动
+  rpc ListDrives(google.protobuf.Empty) returns (ListDrivesResponse);
+
+  // 获取指定驱动状态
+  rpc GetDriveStatus(GetDriveStatusRequest) returns (coldstore.common.DriveEndpoint);
+
+  // 分配驱动（锁定驱动供独占使用）
+  rpc AcquireDrive(AcquireDriveRequest) returns (AcquireDriveResponse);
+
+  // 释放驱动
+  rpc ReleaseDrive(ReleaseDriveRequest) returns (google.protobuf.Empty);
+
+  // ── 磁带操作 ──
+
+  // 加载磁带到驱动（带库场景）
+  rpc LoadTape(LoadTapeRequest) returns (google.protobuf.Empty);
+
+  // 从驱动卸载磁带
+  rpc UnloadTape(UnloadTapeRequest) returns (google.protobuf.Empty);
+
+  // 回卷磁带
+  rpc Rewind(RewindRequest) returns (google.protobuf.Empty);
+
+  // 定位到指定 filemark
+  rpc SeekToFilemark(SeekToFilemarkRequest) returns (google.protobuf.Empty);
+
+  // 获取磁带状态（剩余空间、当前位置等）
+  rpc GetTapeMediaStatus(GetTapeMediaStatusRequest) returns (TapeMediaStatus);
+
+  // 磁带库清点（inventory）
+  rpc Inventory(google.protobuf.Empty) returns (InventoryResponse);
+}
+
+// ---------------------------------------------------------------------------
+//  WriteBundle (client streaming) — 写入归档包
+// ---------------------------------------------------------------------------
+
+message WriteBundleRequest {
+  oneof payload {
+    WriteBundleMeta meta = 1;
+    bytes data = 2;
+  }
+}
+
+message WriteBundleMeta {
+  string drive_id = 1;
+  string bundle_id = 2;
+  uint64 total_size = 3;
+  uint32 object_count = 4;
+  uint32 block_size = 5;
+}
+
+message WriteBundleResponse {
+  string drive_id = 1;
+  string bundle_id = 2;
+  uint64 bytes_written = 3;
+  uint32 filemark_start = 4;
+  uint32 filemark_end = 5;
+  optional string checksum = 6;
+  bool success = 7;
+  optional string error = 8;
+}
+
+// ---------------------------------------------------------------------------
+//  ReadBundle (server streaming) — 读取归档包/对象
+// ---------------------------------------------------------------------------
+
+message ReadBundleRequest {
+  string drive_id = 1;
+  // 定位方式: filemark 或 block offset
+  oneof location {
+    uint32 filemark = 2;
+    uint64 block_offset = 3;
+  }
+  uint64 length = 4;
+}
+
+message ReadBundleResponse {
+  oneof payload {
+    ReadBundleMeta meta = 1;
+    bytes data = 2;
+  }
+}
+
+message ReadBundleMeta {
+  uint64 total_size = 1;
+  optional string checksum = 2;
+}
+
+// ---------------------------------------------------------------------------
+//  驱动管理
+// ---------------------------------------------------------------------------
+
+message ListDrivesResponse {
+  repeated coldstore.common.DriveEndpoint drives = 1;
+}
+
+message GetDriveStatusRequest {
+  string drive_id = 1;
+}
+
+message AcquireDriveRequest {
+  optional string preferred_drive_id = 1;
+  optional string required_tape_id = 2;
+  uint32 priority = 3;
+  uint32 timeout_secs = 4;
+}
+
+message AcquireDriveResponse {
+  string drive_id = 1;
+  optional string current_tape = 2;
+}
+
+message ReleaseDriveRequest {
+  string drive_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+//  磁带操作
+// ---------------------------------------------------------------------------
+
+message LoadTapeRequest {
+  string tape_id = 1;
+  string drive_id = 2;
+  optional string slot_id = 3;
+}
+
+message UnloadTapeRequest {
+  string drive_id = 1;
+  optional string target_slot_id = 2;
+}
+
+message RewindRequest {
+  string drive_id = 1;
+}
+
+message SeekToFilemarkRequest {
+  string drive_id = 1;
+  uint32 filemark = 2;
+}
+
+message GetTapeMediaStatusRequest {
+  string drive_id = 1;
+}
+
+message TapeMediaStatus {
+  string drive_id = 1;
+  optional string tape_id = 2;
+  coldstore.common.TapeStatus tape_status = 3;
+  uint64 capacity_bytes = 4;
+  uint64 used_bytes = 5;
+  uint64 remaining_bytes = 6;
+  uint64 current_position = 7;
+  uint32 current_filemark = 8;
+  bool is_write_protected = 9;
+}
+
+message InventoryResponse {
+  repeated SlotInfo slots = 1;
+}
+
+message SlotInfo {
+  string slot_id = 1;
+  optional string tape_id = 2;
+  bool is_drive = 3;
+  optional string drive_id = 4;
+  bool is_import_export = 5;
+}

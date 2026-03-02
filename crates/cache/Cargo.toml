@@ -1,0 +1,31 @@
+[package]
+name = "coldstore-cache"
+description = "ColdStore cache worker (independent binary, SPDK/HDD backend)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "coldstore-cache"
+path = "src/main.rs"
+
+[dependencies]
+coldstore-proto = { workspace = true }
+coldstore-common = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+config = { workspace = true }
+sha2 = { workspace = true }
+
+# TODO: Phase 3 - SPDK backend
+# async-spdk = { git = "https://github.com/madsys-dev/async-spdk" }
+
+tokio-stream = { workspace = true }

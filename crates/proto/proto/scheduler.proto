@@ -1,0 +1,199 @@
+syntax = "proto3";
+package coldstore.scheduler;
+
+import "common.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// ===========================================================================
+//  SchedulerService — Gateway → Scheduler Worker 接口
+//
+//  Gateway 将所有 S3 请求转发给 Scheduler Worker。
+//  Scheduler 是唯一业务中枢，负责编排元数据、缓存和磁带操作。
+// ===========================================================================
+service SchedulerService {
+
+  // 上传对象：写入即 ColdPending，数据暂存缓存层，等待归档调度
+  // 使用 client streaming 支持大对象
+  rpc PutObject(stream PutObjectRequest) returns (PutObjectResponse);
+
+  // 下载对象：冷对象需已解冻，从缓存层读取
+  // 使用 server streaming 返回大对象数据
+  rpc GetObject(GetObjectRequest) returns (stream GetObjectResponse);
+
+  // 查询对象元数据（HEAD）
+  rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+
+  // 删除对象
+  rpc DeleteObject(DeleteObjectRequest) returns (google.protobuf.Empty);
+
+  // 发起解冻请求（RestoreObject）
+  rpc RestoreObject(RestoreObjectRequest) returns (RestoreObjectResponse);
+
+  // 列出对象
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+
+  // 桶操作
+  rpc CreateBucket(CreateBucketRequest) returns (google.protobuf.Empty);
+  rpc DeleteBucket(DeleteBucketRequest) returns (google.protobuf.Empty);
+  rpc HeadBucket(HeadBucketRequest) returns (google.protobuf.Empty);
+  rpc ListBuckets(google.protobuf.Empty) returns (ListBucketsResponse);
+}
+
+// ---------------------------------------------------------------------------
+//  PutObject (client streaming)
+//  第一个 chunk 携带元数据，后续 chunk 携带数据
+// ---------------------------------------------------------------------------
+
+message PutObjectRequest {
+  oneof payload {
+    PutObjectMeta meta = 1;
+    bytes data = 2;
+  }
+}
+
+message PutObjectMeta {
+  string bucket = 1;
+  string key = 2;
+  uint64 content_length = 3;
+  optional string content_type = 4;
+  optional string checksum_sha256 = 5;
+}
+
+message PutObjectResponse {
+  string etag = 1;
+  string version_id = 2;
+}
+
+// ---------------------------------------------------------------------------
+//  GetObject (server streaming)
+//  第一个 chunk 携带元数据，后续 chunk 携带数据
+// ---------------------------------------------------------------------------
+
+message GetObjectRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+}
+
+message GetObjectResponse {
+  oneof payload {
+    GetObjectMeta meta = 1;
+    bytes data = 2;
+  }
+}
+
+message GetObjectMeta {
+  uint64 content_length = 1;
+  optional string content_type = 2;
+  string etag = 3;
+  coldstore.common.StorageClass storage_class = 4;
+  optional string restore_info = 5;
+  google.protobuf.Timestamp last_modified = 6;
+}
+
+// ---------------------------------------------------------------------------
+//  HeadObject
+// ---------------------------------------------------------------------------
+
+message HeadObjectRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+}
+
+message HeadObjectResponse {
+  uint64 content_length = 1;
+  optional string content_type = 2;
+  string etag = 3;
+  coldstore.common.StorageClass storage_class = 4;
+  optional string restore_info = 5;
+  google.protobuf.Timestamp last_modified = 6;
+}
+
+// ---------------------------------------------------------------------------
+//  DeleteObject
+// ---------------------------------------------------------------------------
+
+message DeleteObjectRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+}
+
+// ---------------------------------------------------------------------------
+//  RestoreObject
+// ---------------------------------------------------------------------------
+
+message RestoreObjectRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+  uint32 days = 4;
+  coldstore.common.RestoreTier tier = 5;
+}
+
+message RestoreObjectResponse {
+  // 202 = accepted (新请求), 200 = already restored (延长)
+  uint32 status_code = 1;
+}
+
+// ---------------------------------------------------------------------------
+//  ListObjects
+// ---------------------------------------------------------------------------
+
+message ListObjectsRequest {
+  string bucket = 1;
+  optional string prefix = 2;
+  optional string marker = 3;
+  optional string delimiter = 4;
+  uint32 max_keys = 5;
+}
+
+message ListObjectsResponse {
+  string bucket = 1;
+  optional string prefix = 2;
+  optional string marker = 3;
+  optional string next_marker = 4;
+  uint32 max_keys = 5;
+  bool is_truncated = 6;
+  repeated ObjectEntry contents = 7;
+  repeated CommonPrefix common_prefixes = 8;
+}
+
+message ObjectEntry {
+  string key = 1;
+  google.protobuf.Timestamp last_modified = 2;
+  string etag = 3;
+  uint64 size = 4;
+  string storage_class = 5;
+}
+
+message CommonPrefix {
+  string prefix = 1;
+}
+
+// ---------------------------------------------------------------------------
+//  Bucket 操作
+// ---------------------------------------------------------------------------
+
+message CreateBucketRequest {
+  string bucket = 1;
+}
+
+message DeleteBucketRequest {
+  string bucket = 1;
+}
+
+message HeadBucketRequest {
+  string bucket = 1;
+}
+
+message ListBucketsResponse {
+  repeated BucketEntry buckets = 1;
+}
+
+message BucketEntry {
+  string name = 1;
+  google.protobuf.Timestamp creation_date = 2;
+}
