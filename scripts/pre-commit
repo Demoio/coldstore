@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+failed=0
+
+echo -e "${YELLOW}[pre-commit]${NC} Running checks..."
+
+# 1. cargo fmt -- check
+echo -e "${YELLOW}[1/4]${NC} cargo fmt --check"
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo -e "${RED}✗ cargo fmt failed. Run 'cargo fmt --all' to fix.${NC}"
+    failed=1
+else
+    echo -e "${GREEN}✓ cargo fmt${NC}"
+fi
+
+# 2. cargo clippy
+echo -e "${YELLOW}[2/4]${NC} cargo clippy"
+if ! cargo clippy --workspace --all-targets -- -D warnings 2>/dev/null; then
+    echo -e "${RED}✗ cargo clippy found warnings/errors.${NC}"
+    failed=1
+else
+    echo -e "${GREEN}✓ cargo clippy${NC}"
+fi
+
+# 3. cargo check
+echo -e "${YELLOW}[3/4]${NC} cargo check"
+if ! cargo check --workspace 2>/dev/null; then
+    echo -e "${RED}✗ cargo check failed.${NC}"
+    failed=1
+else
+    echo -e "${GREEN}✓ cargo check${NC}"
+fi
+
+# 4. cargo test
+echo -e "${YELLOW}[4/4]${NC} cargo test"
+if ! cargo test --workspace --no-fail-fast 2>/dev/null; then
+    echo -e "${RED}✗ cargo test failed.${NC}"
+    failed=1
+else
+    echo -e "${GREEN}✓ cargo test${NC}"
+fi
+
+if [ "$failed" -ne 0 ]; then
+    echo -e "\n${RED}Pre-commit checks failed. Commit aborted.${NC}"
+    exit 1
+fi
+
+echo -e "\n${GREEN}All pre-commit checks passed.${NC}"
