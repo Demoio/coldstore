@@ -714,33 +714,35 @@ async fn handle_get_object(
 
     Span::current().record("coldstore.storage_class", &meta.storage_class.as_str());
 
-    if meta.storage_class == StorageClass::Cold {
-        match meta.restore_status {
-            Some(RestoreStatus::Completed) if meta.restore_expire_at > Some(Utc::now()) => {
-                // 从缓存读取
-                let cached = state.cache.get(bucket, key, None).await?;
-                match cached {
-                    Some(obj) => {
-                        Span::current().record("cache.hit", true);
-                        state.metrics.cache_hits.add(1, &[]);
-                        state.metrics.s3_request_duration.record(
-                            start.elapsed().as_secs_f64() * 1000.0,
-                            &[KeyValue::new("method", "GET"), KeyValue::new("bucket", bucket)],
-                        );
-                        Ok(build_response(obj, &meta))
-                    }
-                    None => {
-                        Span::current().record("cache.hit", false);
-                        state.metrics.cache_misses.add(1, &[]);
-                        Err(Error::ServiceUnavailable("cache miss, please restore again"))
+    // ColdStore 是纯冷归档系统，所有对象都是 Cold 或 ColdPending
+    match meta.storage_class {
+        StorageClass::ColdPending => {
+            Err(Error::InvalidObjectState)
+        }
+        StorageClass::Cold => {
+            match meta.restore_status {
+                Some(RestoreStatus::Completed) if meta.restore_expire_at > Some(Utc::now()) => {
+                    let cached = state.cache.get(bucket, key, None).await?;
+                    match cached {
+                        Some(obj) => {
+                            Span::current().record("cache.hit", true);
+                            state.metrics.cache_hits.add(1, &[]);
+                            state.metrics.s3_request_duration.record(
+                                start.elapsed().as_secs_f64() * 1000.0,
+                                &[KeyValue::new("method", "GET"), KeyValue::new("bucket", bucket)],
+                            );
+                            Ok(build_response(obj, &meta))
+                        }
+                        None => {
+                            Span::current().record("cache.hit", false);
+                            state.metrics.cache_misses.add(1, &[]);
+                            Err(Error::ServiceUnavailable("cache miss, please restore again"))
+                        }
                     }
                 }
+                _ => Err(Error::InvalidObjectState),
             }
-            _ => Err(Error::InvalidObjectState),
         }
-    } else {
-        // 热对象直接返回...
-        todo!()
     }
 }
 ```

@@ -125,7 +125,91 @@ ColdStore 作为纯冷归档系统，PutObject 写入的对象一律标记为 `C
 
 ---
 
-## 8. 模块结构
+## 8. S3 Multipart Upload 支持
+
+### 8.1 设计目标
+
+支持 S3 Multipart Upload API，允许大对象分块上传。对于冷归档系统，
+Multipart Upload 主要用于外部热存储系统向 ColdStore 迁移大文件（GB/TB 级别）。
+
+### 8.2 API 兼容
+
+| API | 说明 | ColdStore 实现 |
+|-----|------|----------------|
+| `CreateMultipartUpload` | 初始化分块上传，返回 upload_id | Scheduler 创建 MultipartUpload 记录到 Metadata |
+| `UploadPart` | 上传单个分块 | Scheduler 将分块暂存到 Cache Worker（StagingWriteApi） |
+| `CompleteMultipartUpload` | 完成上传，合并分块 | Scheduler 合并分块元数据，标记对象为 ColdPending |
+| `AbortMultipartUpload` | 取消上传，清理分块 | Scheduler 删除所有暂存分块 |
+| `ListParts` | 列出已上传的分块 | Scheduler 从 Metadata 查询 |
+| `ListMultipartUploads` | 列出进行中的分块上传 | Scheduler 从 Metadata 查询 |
+
+### 8.3 分块暂存策略
+
+每个 Part 独立暂存在 Cache Worker 中，通过 `staging_id` 标识。
+`CompleteMultipartUpload` 时不做物理合并（避免大量 I/O），
+而是将所有 Part 的 `staging_id` 列表记录在 ObjectMetadata 中，
+归档调度器在写入磁带时顺序读取各 Part 并连续写入。
+
+```
+分块上传流程:
+
+1. CreateMultipartUpload → upload_id
+2. UploadPart(upload_id, part_number, data) × N
+   └─ 每个 Part 独立暂存到 Cache Worker
+3. CompleteMultipartUpload(upload_id, parts[])
+   └─ 验证所有 Part 已上传
+   └─ 创建 ObjectMetadata (ColdPending, staging_ids=[...])
+   └─ 对象整体 checksum 由 S3 ETag 规则计算
+
+归档时:
+  调度器按 part_number 顺序从 Cache Worker 读取各 Part
+  连续写入磁带，磁带上视为单个对象
+```
+
+### 8.4 元数据扩展
+
+```rust
+pub struct MultipartUploadInfo {
+    pub upload_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub parts: Vec<PartInfo>,
+    pub created_at: DateTime<Utc>,
+    pub status: MultipartUploadStatus,
+}
+
+pub struct PartInfo {
+    pub part_number: u32,
+    pub staging_id: String,
+    pub size: u64,
+    pub etag: String,
+    pub uploaded_at: DateTime<Utc>,
+}
+
+pub enum MultipartUploadStatus {
+    InProgress,
+    Completed,
+    Aborted,
+}
+```
+
+### 8.5 约束
+
+| 约束 | 值 | 说明 |
+|------|------|------|
+| 最大分块数 | 10,000 | 与 S3 一致 |
+| 最小分块大小 | 5 MB | 除最后一块外，与 S3 一致 |
+| 最大分块大小 | 5 GB | 与 S3 一致 |
+| 最大对象大小 | 5 TB | 10,000 × 5GB 理论上限 |
+| 上传超时 | 7 天 | 超时后自动清理暂存分块 |
+
+### 8.6 清理机制
+
+后台定时任务扫描超时未完成的 Multipart Upload，自动执行 Abort 并清理暂存分块。
+
+---
+
+## 9. 模块结构
 
 ```
 src/
@@ -140,7 +224,7 @@ src/
 
 ---
 
-## 9. 依赖关系
+## 10. 依赖关系
 
 | 依赖 | 用途 |
 |------|------|
@@ -151,7 +235,7 @@ src/
 
 ---
 
-## 10. 参考资料
+## 11. 参考资料
 
 - [AWS S3 RestoreObject API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_RestoreObject.html)
 - [S3 Glacier Retrieval Options](https://docs.aws.amazon.com/AmazonS3/latest/userguide/restoring-objects-retrieval-options.html)

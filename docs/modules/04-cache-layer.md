@@ -5,7 +5,10 @@
 
 ## 1. 模块概述
 
-数据缓存层承载从磁带取回的解冻数据，供 GET 请求快速响应，避免重复触发磁带读取。
+数据缓存层承担两大核心职责：
+
+1. **PutObject 数据暂存**：接收 PutObject 写入的原始数据，作为归档到磁带前的临时暂存区
+2. **解冻数据缓存**：承载从磁带取回的解冻数据，供 GET 请求快速响应，避免重复触发磁带读取
 
 > **部署模型**：缓存层运行在 **Cache Worker** 节点上，与 **Scheduler Worker** 同机部署。
 > Scheduler 通过 gRPC 与 Cache Worker 通信（虽然同机，仍使用 gRPC 保持架构一致性）。
@@ -13,7 +16,8 @@
 
 ### 1.1 职责
 
-- 存储解冻后的对象数据
+- **PutObject 暂存**：接收并暂存 PutObject 的数据，等待调度器归档到磁带
+- **解冻数据缓存**：存储从磁带取回的解冻对象数据
 - 响应 GET 请求（冷对象已解冻时）
 - 缓存淘汰：LRU、LFU、TTL、容量限制
 - 与 SPDK 集成，实现高性能用户态 I/O
@@ -21,9 +25,14 @@
 ### 1.2 在架构中的位置
 
 ```
-取回调度器 ──► 磁带读取 ──► 数据缓存层 ──► 协议层/接入层 ──► GET 响应
-                                │
-                                └─ async-spdk (SPDK Blobstore on bdev)
+PutObject 写入流程:
+  接入层 ──► Scheduler ──► Cache Worker (暂存) ──► 等待归档调度
+                                                       │
+归档流程:                                              ▼
+  归档调度器 ──► Cache Worker (读取暂存数据) ──► 磁带写入 ──► 删除暂存
+
+取回流程:
+  取回调度器 ──► 磁带读取 ──► Cache Worker (缓存) ──► GET 响应
 
 注意：缓存层不直接持有元数据 client。
 元数据更新由调度层统一负责（方案 B）。
@@ -371,7 +380,123 @@ pub struct CacheStats {
 
 ---
 
-## 5. 缓存策略
+## 5. PutObject 数据暂存
+
+ColdStore 是纯冷归档系统，PutObject 写入的数据不会直接发送到磁带，而是先暂存在 Cache Worker 中，
+等待调度器扫描 `ColdPending` 对象后聚合写入磁带。暂存数据与解冻缓存使用相同的存储后端，但逻辑上独立管理。
+
+### 5.1 暂存流程
+
+```
+PutObject 完整数据流:
+
+1. Gateway 接收 S3 PutObject 请求
+2. Gateway → Scheduler Worker (gRPC: PutObject)
+3. Scheduler → Cache Worker (gRPC: PutStaging)
+   └─ Cache Worker 将数据写入暂存区，返回 staging_id
+4. Scheduler → Metadata (Raft: PutObject)
+   └─ 写入 ObjectMetadata (storage_class=ColdPending, staging_id)
+5. Scheduler → Gateway: 返回 200 OK
+
+归档时数据流:
+
+1. 归档调度器扫描 ColdPending 对象
+2. Scheduler → Cache Worker (gRPC: GetStaging)
+   └─ 按 staging_id 读取暂存数据
+3. Scheduler → Tape Worker (gRPC: Write)
+   └─ 数据写入磁带
+4. Scheduler → Metadata (Raft: 更新 ObjectMetadata → Cold)
+5. Scheduler → Cache Worker (gRPC: DeleteStaging)
+   └─ 归档完成后删除暂存数据
+```
+
+### 5.2 暂存接口定义
+
+```rust
+/// 缓存层提供给调度层的暂存写入接口
+#[async_trait]
+pub trait StagingWriteApi: Send + Sync {
+    /// 写入暂存数据，返回 staging_id
+    async fn put_staging(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        data: &[u8],
+        checksum: &str,
+    ) -> Result<String>;
+
+    /// 删除暂存数据（归档完成后调用）
+    async fn delete_staging(&self, staging_id: &str) -> Result<()>;
+
+    /// 批量删除暂存数据
+    async fn delete_staging_batch(&self, staging_ids: &[String]) -> Result<()>;
+}
+
+/// 缓存层提供给调度层的暂存读取接口
+#[async_trait]
+pub trait StagingReadApi: Send + Sync {
+    /// 按 staging_id 读取暂存数据
+    async fn get_staging(&self, staging_id: &str) -> Result<Option<StagedObject>>;
+}
+
+pub struct StagedObject {
+    pub staging_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+    pub data: Vec<u8>,
+    pub size: u64,
+    pub checksum: String,
+    pub staged_at: DateTime<Utc>,
+}
+```
+
+### 5.3 暂存数据布局
+
+暂存数据与解冻缓存共用存储后端（SPDK Blobstore / HDD），但通过 xattr 中的 `data_type` 字段区分：
+
+| xattr key | 值 | 说明 |
+|-----------|------|------|
+| `data_type` | `"staging"` | 暂存数据（PutObject 写入，待归档） |
+| `data_type` | `"restored"` | 解冻数据（磁带取回，供 GET 读取） |
+| `staging_id` | UUID 字符串 | 暂存数据唯一标识（仅 staging 类型） |
+
+### 5.4 暂存数据生命周期
+
+| 阶段 | 事件 | 说明 |
+|------|------|------|
+| 写入 | PutObject 请求到达 | Scheduler 调用 `put_staging`，数据写入 Cache Worker |
+| 等待 | 对象处于 ColdPending | 暂存数据留存，等待归档调度器扫描 |
+| 读取 | 归档调度器聚合 Bundle | Scheduler 调用 `get_staging` 读取数据，写入磁带 |
+| 删除 | 归档完成 | Scheduler 调用 `delete_staging` 清理暂存数据 |
+| 超时清理 | 对象被删除但暂存残留 | 后台定时扫描清理孤儿暂存数据 |
+
+### 5.5 容量管理
+
+暂存数据与解冻缓存共享容量，通过以下策略管理：
+
+- **容量预留**：可配置 `staging_reserved_percent`（如 30%），保证暂存空间
+- **背压**：当暂存区使用率超过阈值时，PutObject 返回 `503 SlowDown`，由外部系统降速
+- **优先淘汰**：容量不足时，优先淘汰已过期的解冻缓存数据，暂存数据不主动淘汰（除非对象已删除）
+
+### 5.6 ObjectMetadata 中的 staging_id
+
+`ObjectMetadata` 增加 `staging_id` 字段，记录对象在 Cache Worker 中的暂存标识：
+
+```rust
+pub struct ObjectMetadata {
+    // ... 已有字段 ...
+    pub staging_id: Option<String>,    // Cache Worker 中暂存数据的 ID
+    pub staging_worker_id: Option<u64>, // 暂存数据所在的 Cache Worker
+}
+```
+
+归档完成后，调度层将 `staging_id` 和 `staging_worker_id` 清空。
+
+---
+
+## 6. 缓存策略
 
 | 策略 | 说明 |
 |------|------|
@@ -395,9 +520,9 @@ pub enum EvictionPolicy {
 
 ---
 
-## 6. 与调度层的对接
+## 7. 与调度层的对接
 
-### 5.1 接口定义
+### 7.1 接口定义
 
 ```rust
 /// 缓存层提供给调度层的接口
@@ -433,7 +558,7 @@ pub struct RestoredItem {
 
 > `delete` 方法用于接入层 DeleteObject 时清理缓存（由接入层调用）。
 
-### 5.2 调用时机与流程
+### 7.2 调用时机与流程
 
 缓存层自身**不**触发元数据更新。写入完成后返回 `Result<()>` 给调度层，由调度层统一负责后续元数据变更。
 
@@ -452,7 +577,7 @@ pub struct RestoredItem {
 
 > **关键原则**：缓存层是纯数据存储，不持有 MetadataClient。元数据写入入口收敛在调度层。
 
-### 5.3 数据流与校验
+### 7.3 数据流与校验
 
 | 步骤 | 负责方 | 说明 |
 |------|--------|------|
@@ -461,7 +586,7 @@ pub struct RestoredItem {
 | 更新元数据 | **调度器** | restore_status=Completed, restore_expire_at |
 | GET 时校验 | 协议层/缓存层 | 可选读后校验 checksum |
 
-### 5.4 失败与重试
+### 7.4 失败与重试
 
 - 缓存写入失败：调度器重试 2 次，仍失败则 RecallTask 标记 Failed，**不更新元数据**
 - 缓存层空间不足：先触发淘汰，再写入；若仍不足则返回错误，调度器不更新元数据
@@ -469,9 +594,9 @@ pub struct RestoredItem {
 
 ---
 
-## 7. 与元数据层的关系（方案 B：缓存层不直接依赖元数据）
+## 8. 与元数据层的关系（方案 B：缓存层不直接依赖元数据）
 
-### 6.1 设计原则
+### 8.1 设计原则
 
 **缓存层不持有 MetadataClient，不直接读写元数据。**
 
@@ -481,7 +606,7 @@ pub struct RestoredItem {
 
 缓存层是纯粹的数据存储层，只暴露 `CacheReadApi` 和 `CacheWriteApi`。
 
-### 6.2 缓存层对元数据的间接关系
+### 8.2 缓存层对元数据的间接关系
 
 | 场景 | 依赖 | 说明 |
 |------|------|------|
@@ -490,7 +615,7 @@ pub struct RestoredItem {
 | 写入时 | 无 | 调度层传入 expire_at，缓存层直接写入 xattr |
 | 启动时 | 无 | 从 Blobstore xattrs 重建内存索引，不依赖元数据 |
 
-### 6.3 一致性保证（由调度层负责）
+### 8.3 一致性保证（由调度层负责）
 
 | 顺序 | 操作 | 负责方 |
 |------|------|--------|
@@ -503,9 +628,9 @@ pub struct RestoredItem {
 
 ---
 
-## 8. 与协议层/接入层的对接
+## 9. 与协议层/接入层的对接
 
-### 7.1 接口定义
+### 9.1 接口定义
 
 ```rust
 /// 缓存层提供给协议层/接入层的接口
@@ -529,7 +654,7 @@ pub trait CacheReadApi: Send + Sync {
 
 > `CachedObject` 定义见 §4.6，包含 data、size、expire_at、content_type、etag、checksum。
 
-### 7.2 协议层调用流程
+### 9.2 协议层调用流程
 
 ```
 GET /{bucket}/{key}
@@ -550,7 +675,7 @@ GET /{bucket}/{key}
            if None:      返回 404 或 503（缓存丢失，需重新 Restore）
 ```
 
-### 7.3 缓存未命中处理
+### 9.3 缓存未命中处理
 
 | 情况 | 协议层行为 |
 |------|------------|
@@ -558,7 +683,7 @@ GET /{bucket}/{key}
 | 缓存已淘汰（TTL 内） | 同上，元数据 restore_expire_at 未过期但缓存已删 |
 | 缓存损坏 | 校验失败时返回 500，建议重新 Restore |
 
-### 7.4 响应头
+### 9.4 响应头
 
 GET 命中缓存时，协议层需附加：
 
@@ -568,7 +693,7 @@ x-amz-restore: ongoing-request="false", expiry-date="Fri, 28 Feb 2025 12:00:00 G
 
 ---
 
-## 9. 对接汇总图（方案 B）
+## 10. 对接汇总图（方案 B）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -605,7 +730,7 @@ x-amz-restore: ongoing-request="false", expiry-date="Fri, 28 Feb 2025 12:00:00 G
 
 ---
 
-## 10. 集成方式
+## 11. 集成方式
 
 - **方案 A**：缓存服务独立二进制，通过 gRPC/HTTP 与主服务通信
 - **方案 B**：主进程在 SPDK block_on 内启动 Axum（需调整启动顺序）
@@ -613,7 +738,7 @@ x-amz-restore: ongoing-request="false", expiry-date="Fri, 28 Feb 2025 12:00:00 G
 
 ---
 
-## 11. 模块结构
+## 12. 模块结构
 
 ```
 src/cache/
@@ -630,7 +755,7 @@ src/cache/
 
 ---
 
-## 12. 配置项
+## 13. 配置项
 
 ```yaml
 cache:
@@ -648,20 +773,22 @@ cache:
 
 ---
 
-## 13. 依赖关系
+## 14. 依赖关系
 
 | 对接方 | 方向 | 接口 | 说明 |
 |--------|------|------|------|
-| 调度层 | 调度 → 缓存 | `CacheWriteApi`: `put_restored` / `put_restored_batch` | 取回后写数据 |
+| 调度层 | 调度 → 缓存 | `StagingWriteApi`: `put_staging` / `delete_staging` | PutObject 数据暂存与归档后清理 |
+| 调度层 | 调度 → 缓存 | `StagingReadApi`: `get_staging` | 归档时读取暂存数据 |
+| 调度层 | 调度 → 缓存 | `CacheWriteApi`: `put_restored` / `put_restored_batch` | 取回后写解冻数据 |
 | 接入层 | 接入 → 缓存 | `CacheWriteApi`: `delete` | DeleteObject 时清理缓存 |
-| 协议层/接入层 | 协议 → 缓存 | `CacheReadApi`: `get` / `contains` | GET 读数据 |
+| 协议层/接入层 | 协议 → 缓存 | `CacheReadApi`: `get` / `contains` | GET 读解冻数据 |
 | 元数据层 | **无依赖** | — | 缓存层不持有 MetadataClient |
 
 > **方案 B 原则**：缓存层是纯数据存储，不感知元数据。元数据写入由调度层统一协调。
 
 ---
 
-## 14. 参考资料
+## 15. 参考资料
 
 - [async-spdk](https://github.com/madsys-dev/async-spdk)（含 hello_blob 示例）
 - [SPDK Blobstore Programmer's Guide](https://spdk.io/doc/blob.html)

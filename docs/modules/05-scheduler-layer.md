@@ -91,27 +91,32 @@
 ### 2.3 顺序写入流水线
 
 ```
-┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-│ 对象读取  │───▶│ 块对齐   │───▶│ 双缓冲   │───▶│ 磁带写入  │
-│ (热存储)  │    │ 填充     │    │ 流水线   │    │ (顺序)   │
-└──────────┘    └──────────┘    └──────────┘    └──────────┘
+┌──────────────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│ 对象读取           │───▶│ 块对齐   │───▶│ 双缓冲   │───▶│ 磁带写入  │
+│ (Cache Worker 暂存)│    │ 填充     │    │ 流水线   │    │ (顺序)   │
+└──────────────────┘    └──────────┘    └──────────┘    └──────────┘
 ```
 
+- **数据来源**：归档时对象数据从 Cache Worker 暂存区读取（`StagingReadApi.get_staging`），不从外部热存储读取
 - **块对齐**：不足 block_size 的对象尾部填充（padding），或使用可变块（需驱动支持）
 - **双缓冲**：预读下一批数据，写入当前批，保持驱动持续流式写入
-- **背压**：若热存储读取慢于磁带写入，可降低并发或增大缓冲
+- **背压**：若 Cache Worker 读取慢于磁带写入，可降低并发或增大缓冲
 
 ### 2.4 归档流程（细化）
 
-1. **调度层**：从元数据扫描 ColdPending，按策略聚合为 ArchiveBundle
-2. **调度层**：选定目标磁带（当前写入头或新磁带）
-3. **调度层 → 磁带层**：申请磁带驱动，获取独占
-4. **磁带层**：顺序写入：FileMark → [Obj1 Header + Data] → FileMark → [Obj2...]
-5. **调度层**：写入完成后计算并存储 Bundle 校验和（可选）
-6. **调度层 → 元数据层**：更新 ObjectMetadata（Cold, archive_id, tape_id, tape_block_offset）、ArchiveBundle、TapeInfo
-7. **调度层 → 磁带层**：释放驱动；释放在线存储空间
+1. **调度层**：从元数据扫描 ColdPending 对象，获取 `staging_id` 和 `staging_worker_id`
+2. **调度层**：按策略聚合为 ArchiveBundle
+3. **调度层**：选定目标磁带（当前写入头或新磁带）
+4. **调度层 → Cache Worker**：按 `staging_id` 从 Cache Worker 暂存区读取对象数据（`StagingReadApi.get_staging`）
+5. **调度层 → 磁带层**：申请磁带驱动，获取独占
+6. **磁带层**：顺序写入：FileMark → [Obj1 Header + Data] → [Obj2...] → FileMark
+7. **调度层**：写入完成后计算并存储 Bundle 校验和（可选）
+8. **调度层 → 元数据层**：更新 ObjectMetadata（Cold, archive_id, tape_id, tape_block_offset，清空 staging_id）、ArchiveBundle、TapeInfo
+9. **调度层 → Cache Worker**：删除暂存数据（`StagingWriteApi.delete_staging_batch`）
+10. **调度层 → 磁带层**：释放驱动
 
-> 步骤 6 由调度层统一负责，磁带层不直接写元数据。
+> 步骤 4 的数据来源是 Cache Worker 暂存区，而非外部热存储。
+> 步骤 8-9 由调度层统一负责，磁带层和缓存层不直接写元数据。
 
 ### 2.5 归档关键参数
 
@@ -242,7 +247,7 @@ Level 3: 同对象的多个 RecallTask（重复请求）
 
 ### 4.3 归档调度周期
 
-- **扫描周期**：`scan_interval_secs`（如 3600s）
+- **扫描周期**：`scan_interval_secs`（默认 60s）
 - **触发条件**：定时 + 可选事件触发（ColdPending 积累达阈值）
 - **并发**：多驱动时可并行执行多个 ArchiveTask，每个 Task 独占一驱动
 
@@ -328,9 +333,88 @@ Level 3: 同对象的多个 RecallTask（重复请求）
 
 ---
 
-## 8. 核心数据结构
+## 8. DeleteObject 对归档数据的处理
 
-### 8.1 ArchiveScheduler
+### 8.1 设计原则
+
+磁带是追加写入介质，无法随机删除已写入的数据。DeleteObject 操作需分阶段处理：
+
+1. **即时阶段**：立即删除元数据和缓存中的数据
+2. **延迟回收阶段**：磁带上的物理空间通过"标记删除 + 磁带整理"回收
+
+### 8.2 DeleteObject 流程
+
+```
+DeleteObject 请求处理:
+
+1. Scheduler 接收 Gateway 转发的 DELETE 请求
+2. Scheduler → Metadata: 查询 ObjectMetadata
+3. 根据对象状态分支处理:
+
+   ── ColdPending（尚未归档）:
+   4a. Scheduler → Cache Worker: DeleteStaging(staging_id)  // 删除暂存数据
+   5a. Scheduler → Metadata: DeleteObject                   // 删除元数据
+   6a. 完成。暂存数据和元数据均已清理
+
+   ── Cold（已归档到磁带）:
+   4b. Scheduler → Cache Worker: Delete(bucket, key)         // 清理解冻缓存（如有）
+   5b. Scheduler → Metadata: MarkObjectDeleted(bucket, key)  // 标记元数据为 Deleted
+       └─ 不立即删除 ObjectMetadata，保留 archive_id/tape_id 供后续磁带整理参考
+   6b. Scheduler → Metadata: IncrementBundleDeleteCount(archive_id)
+       └─ 记录 ArchiveBundle 中已删除对象数
+   7b. 完成。磁带上的物理数据在后续整理时回收
+```
+
+### 8.3 磁带空间回收策略
+
+磁带空间不支持就地回收，需通过**磁带整理（Tape Compaction）**实现。
+当一盘磁带上的有效数据比例低于阈值时，触发整理：
+
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| `compaction_threshold` | 0.3 | 有效数据低于 30% 时触发整理 |
+| `compaction_scan_interval_secs` | 86400 | 每天扫描一次 |
+
+**整理流程**：
+
+```
+1. 扫描 TapeInfo，计算每盘磁带的有效数据比例:
+   有效比例 = (总写入 - 已删除对象大小) / 总容量
+2. 对有效比例 < compaction_threshold 的磁带:
+   a. 读取磁带上所有未删除对象
+   b. 将有效对象重新聚合为新 ArchiveBundle
+   c. 写入新磁带
+   d. 更新元数据（新 archive_id、tape_id）
+   e. 旧磁带标记为可复用或退役
+```
+
+### 8.4 ObjectMetadata 状态扩展
+
+为支持延迟删除，`StorageClass` 不需要新增状态。DeleteObject 直接从 `cf_objects` 中删除记录，
+但在 `cf_deleted_objects` 中保留必要信息供磁带整理参考：
+
+```rust
+pub struct DeletedObjectRecord {
+    pub bucket: String,
+    pub key: String,
+    pub archive_id: Uuid,
+    pub tape_id: String,
+    pub size: u64,
+    pub deleted_at: DateTime<Utc>,
+}
+```
+
+对应新增 Column Family：
+
+| CF 名称 | Key 格式 | Value 类型 | 说明 |
+|---------|----------|-----------|------|
+| `cf_deleted_objects` | `del:{archive_id}:{bucket}:{key}` | DeletedObjectRecord | 已删除对象记录，供磁带整理参考 |
+
+---
+
+## 9. 核心数据结构
+
+### 9.1 ArchiveScheduler
 
 ```rust
 pub struct ArchiveScheduler {
@@ -348,7 +432,7 @@ pub struct ArchiveScheduler {
 | `config` | ArchiveConfig | 归档配置 | 聚合参数、块大小、缓冲等 |
 | `running` | AtomicBool | 运行状态标记 | 优雅停止扫描循环 |
 
-### 8.2 RecallScheduler
+### 9.2 RecallScheduler
 
 ```rust
 pub struct RecallScheduler {
@@ -368,7 +452,7 @@ pub struct RecallScheduler {
 | `queue` | RecallQueue | 取回优先级队列 | 三级优先级 + 合并窗口 |
 | `config` | RecallConfig | 取回配置 | 队列大小、超时、合并窗口等 |
 
-### 8.3 ArchiveBundle（归档包）
+### 9.3 ArchiveBundle（归档包）
 
 一批对象在磁带上的连续写入单元，是归档调度的基本粒度。
 
@@ -402,7 +486,7 @@ pub struct ArchiveBundle {
 | `created_at` | DateTime\<Utc\> | 创建时间 | 聚合窗口计算 |
 | `completed_at` | Option\<DateTime\<Utc\>\> | 完成时间 | 审计与可观测性 |
 
-### 8.4 BundleEntry（Bundle 内单个对象条目）
+### 9.4 BundleEntry（Bundle 内单个对象条目）
 
 描述一个对象在 Bundle 内的物理位置，用于取回时精确定位。
 
@@ -428,7 +512,7 @@ pub struct BundleEntry {
 | `tape_block_offset` | u64 | 对象在磁带上的块偏移（相对 FileMark） | `MTFSR(tape_block_offset)` 精确定位 |
 | `checksum` | String | SHA256 hex | 取回时校验数据完整性 |
 
-### 8.5 ObjectHeader（磁带上对象头）
+### 9.5 ObjectHeader（磁带上对象头）
 
 写入磁带时，每个对象前写入 Header，采用**定长前缀 + 变长 bucket/key** 的混合格式。解析时先读定长部分获取 `bucket_len`/`key_len`，再按长度读取变长字符串。
 
@@ -462,7 +546,7 @@ pub struct ObjectHeader {
 | `flags` | u8 | 标志位（bit 0: 压缩, bit 1: 加密） | 预留，当前全 0 |
 | `reserved` | [u8; 16] | 保留字段 | 未来扩展，写入时全 0 |
 
-### 8.6 ArchiveTask（归档任务）
+### 9.6 ArchiveTask（归档任务）
 
 ```rust
 pub struct ArchiveTask {
@@ -498,7 +582,7 @@ pub struct ArchiveTask {
 | `completed_at` | Option\<DateTime\<Utc\>\> | 完成时间 | 计算耗时 |
 | `error` | Option\<String\> | 错误信息 | Failed 时记录原因 |
 
-### 8.7 RecallTask（取回任务）
+### 9.7 RecallTask（取回任务）
 
 ```rust
 pub struct RecallTask {
@@ -548,7 +632,7 @@ pub struct RecallTask {
 | `completed_at` | Option\<DateTime\<Utc\>\> | 完成时间 | 计算耗时 |
 | `error` | Option\<String\> | 错误信息 | 失败原因 |
 
-### 8.8 RestoreTier（取回优先级）
+### 9.8 RestoreTier（取回优先级）
 
 ```rust
 pub enum RestoreTier {
@@ -564,7 +648,7 @@ pub enum RestoreTier {
 | `Standard` | 标准 | 3–5 小时 | 中 |
 | `Bulk` | 批量 | 5–12 小时 | 最低 |
 
-### 8.9 TapeReadJob（磁带读取作业）
+### 9.9 TapeReadJob（磁带读取作业）
 
 取回合并后的执行单元，一个 TapeReadJob = 一次换带 + 一次顺序读取。
 
@@ -590,7 +674,7 @@ pub struct TapeReadJob {
 | `total_bytes` | u64 | 总字节数 | 监控 |
 | `priority` | RestoreTier | 作业优先级（取组内最高） | 驱动分配排序 |
 
-### 8.10 ReadSegment（读取段）
+### 9.10 ReadSegment（读取段）
 
 ```rust
 pub struct ReadSegment {
@@ -606,7 +690,7 @@ pub struct ReadSegment {
 | `filemark` | u32 | 该 Bundle 的起始 FileMark（来自 `ArchiveBundle.filemark_start`） | `MTFSF(filemark)` 定位 |
 | `objects` | Vec\<ReadObject\> | 段内对象列表，按 tape_block_offset 升序 | 顺序读取 |
 
-### 8.11 ReadObject（待读取对象）
+### 9.11 ReadObject（待读取对象）
 
 ```rust
 pub struct ReadObject {
@@ -630,7 +714,7 @@ pub struct ReadObject {
 | `checksum` | String | SHA256 hex | 读取后校验 |
 | `expire_at` | DateTime\<Utc\> | 解冻过期时间 | 写入缓存 xattr |
 
-### 8.12 TapeWriteJob（磁带写入作业）
+### 9.12 TapeWriteJob（磁带写入作业）
 
 ```rust
 pub struct TapeWriteJob {
@@ -652,7 +736,7 @@ pub struct TapeWriteJob {
 | `bytes_written` | u64 | 已写字节 | 进度追踪 |
 | `objects_written` | u32 | 已写对象数 | 进度追踪 |
 
-### 8.13 RecallQueue（取回优先级队列）
+### 9.13 RecallQueue（取回优先级队列）
 
 ```rust
 pub struct RecallQueue {
@@ -677,7 +761,7 @@ pub struct RecallQueue {
 - **出队/合并**：合并时从 `pending_by_tape` 按 tape 分组取出任务，结合优先级队列做排序
 - **完成/取消**：任务完成或取消后，从 `pending_by_tape` 中移除对应 task_id
 
-### 8.14 枚举汇总
+### 9.14 枚举汇总
 
 ```rust
 pub enum ArchiveBundleStatus {
@@ -706,7 +790,7 @@ pub enum RestoreStatus {
 
 ---
 
-## 9. 模块结构
+## 10. 模块结构
 
 ```
 src/scheduler/
@@ -728,16 +812,16 @@ src/scheduler/
 
 ---
 
-## 10. 配置项
+## 11. 配置项
 
 ```yaml
 scheduler:
   archive:
-    scan_interval_secs: 3600
+    scan_interval_secs: 60
     batch_size: 1000
     min_archive_size_mb: 100
     max_archive_size_mb: 10240
-    aggregation_window_secs: 3600
+    aggregation_window_secs: 300
     block_size: 262144
     write_buffer_mb: 64
     target_throughput_mbps: 300
@@ -757,7 +841,7 @@ scheduler:
 
 ---
 
-## 11. 依赖关系
+## 12. 依赖关系
 
 **调度层主动依赖**：
 
@@ -780,10 +864,89 @@ scheduler:
 
 ---
 
-## 12. 实施要点
+## 13. 实施要点
 
 - 归档与取回可独立扩缩容
 - 每个磁带驱动对应一条顺序 I/O 流水线，避免多任务共享同一驱动导致 seek
 - 增加驱动可线性提升并发归档与取回能力
 - 元数据需记录 `tape_block_offset`，供取回时按物理顺序排序
-- **调度层同时注入 MetadataClient + CacheWriteApi + TapeManager**，是系统中唯一的编排者
+- **调度层同时注入 MetadataClient + CacheWriteApi + StagingReadApi + TapeManager**，是系统中唯一的编排者
+
+---
+
+## 14. 多 Scheduler Worker 扩展（待设计）
+
+> **状态：占位章节，具体方案后续确定。**
+
+当前阶段 Scheduler Worker 以单实例运行，后续需支持多 Scheduler Worker 横向扩展。
+以下列出需要在后续设计中解决的核心问题：
+
+### 14.1 待解决问题
+
+| 问题 | 描述 | 可能方向 |
+|------|------|----------|
+| **ColdPending 扫描分区** | 多个 Scheduler 同时扫描 ColdPending 会导致重复归档 | 按 bucket/key hash 分区、Metadata 侧支持 claim 机制 |
+| **RecallTask 分配** | 多个 Scheduler 如何分配取回任务 | 基于 tape_id 亲和性分配、通过 Metadata 做分布式锁 |
+| **驱动竞争** | 多个 Scheduler 对同一 Tape Worker 的驱动竞争 | Tape Worker 侧排队、Scheduler 间协商 |
+| **主备 vs 对等** | 是采用主备模式还是对等模式 | 主备简单但切换慢、对等需要更复杂的协调 |
+| **故障转移** | Scheduler 故障时任务如何重新分配 | InProgress 任务超时后由其他 Scheduler 接管 |
+| **Cache Worker 亲和** | 每个 Scheduler 与同机 Cache Worker 绑定 | 通过 `paired_cache_worker_id` 保持亲和 |
+
+### 14.2 已有的接口预留
+
+当前已在 `SchedulerWorkerInfo` 中预留了多 Scheduler 支持字段：
+
+- `is_active: bool` — 主备模式下标识活跃 Scheduler
+- `paired_cache_worker_id: u64` — 同机 Cache Worker 绑定
+
+### 14.3 约束条件
+
+- 多 Scheduler 方案不得改变现有的 gRPC 接口协议
+- Gateway 可配置多个 Scheduler 地址，支持负载均衡
+- 磁带层和缓存层无需感知 Scheduler 数量变化
+
+---
+
+## 15. FileMark 使用精确定义
+
+### 15.1 磁带上 ArchiveBundle 的物理结构
+
+每个 ArchiveBundle 在磁带上的布局如下。**FileMark 仅在 Bundle 边界处写入**，
+Bundle 内的对象之间不写 FileMark，通过块偏移定位：
+
+```
+磁带物理布局:
+
+[BOT] ... [FM_prev] [Bundle N 起始] [Obj1 Header][Obj1 Data][Obj2 Header][Obj2 Data]...[ObjN Data] [FM_end] ...
+
+说明:
+  - FM_prev:   前一个 Bundle 的结束 FileMark（同时也是当前 Bundle 的起始定位点）
+  - Bundle 数据: 对象连续写入，无 FileMark 分隔
+  - FM_end:    当前 Bundle 写入完成后追加的 FileMark
+
+对于第一个 Bundle:
+  [BOT] [Obj1 Header][Obj1 Data]...[ObjN Data] [FM_0]
+
+后续 Bundle:
+  [FM_0] [Obj1 Header][Obj1 Data]...[ObjN Data] [FM_1]
+```
+
+### 15.2 filemark_start 与 filemark_end 含义
+
+| 字段 | 含义 | 取回定位方式 |
+|------|------|-------------|
+| `filemark_start` | Bundle 起始位置前的 FileMark 编号（从 BOT 算起第几个 FM） | 从 BOT 执行 `MTFSF(filemark_start)` 跳到 Bundle 起始位置 |
+| `filemark_end` | Bundle 结束后写入的 FileMark 编号 | 标记 Bundle 边界，下一个 Bundle 的 `filemark_start = 当前 filemark_end` |
+
+对于磁带上的第一个 Bundle，`filemark_start = 0`（表示从 BOT 开始，不需要跳过 FM）。
+
+### 15.3 Bundle 内对象定位
+
+Bundle 内的对象通过 `tape_block_offset`（相对于 Bundle 起始位置的块偏移）定位：
+
+```
+取回单个对象:
+1. MTFSF(filemark_start)    → 跳到 Bundle 起始
+2. MTFSR(tape_block_offset) → 在 Bundle 内按块偏移前进到目标对象
+3. read(object_size)        → 读取对象数据
+```

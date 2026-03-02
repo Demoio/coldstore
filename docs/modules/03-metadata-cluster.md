@@ -609,6 +609,49 @@ pub struct LibraryEndpoint {
 - Metadata Leader 每 15s 扫描，连续 3 次未收到心跳（>15s）的 Worker 标记为 `Offline`
 - Offline 的 Tape Worker 上的驱动不再被调度器分配任务
 
+**Leader 切换时的 last_heartbeat 处理**：
+
+`last_heartbeat` 仅在 Leader 本地内存维护，不写入 Raft 日志。Leader 切换后，新 Leader 
+的 `last_heartbeat` 表为空，需要特殊处理以避免误判所有 Worker 为 Offline：
+
+1. **宽限期（Grace Period）**：新 Leader 就任后，设置一个等于 2 倍心跳间隔（即 10s）的宽限期。
+   宽限期内不执行失联检测
+2. **首次心跳恢复**：宽限期内收到的首次心跳即恢复该 Worker 的 `last_heartbeat` 记录
+3. **宽限期后处理**：宽限期结束后，仍未收到心跳的 Worker 标记为 `Offline`
+   （这些 Worker 确实已失联，不是 Leader 切换造成的误判）
+
+```rust
+pub struct HeartbeatManager {
+    last_heartbeat: HashMap<(WorkerType, u64), Instant>,
+    leader_since: Option<Instant>,
+    grace_period: Duration,  // 默认 10s（2 × heartbeat_interval）
+}
+
+impl HeartbeatManager {
+    fn on_become_leader(&mut self) {
+        self.last_heartbeat.clear();
+        self.leader_since = Some(Instant::now());
+    }
+
+    fn is_in_grace_period(&self) -> bool {
+        self.leader_since
+            .map(|since| since.elapsed() < self.grace_period)
+            .unwrap_or(false)
+    }
+
+    fn check_offline(&self) -> Vec<(WorkerType, u64)> {
+        if self.is_in_grace_period() {
+            return vec![];
+        }
+        // 正常失联检测逻辑...
+    }
+}
+```
+
+**持久化策略**：`last_heartbeat` 本身不需要持久化到 Raft（高频写入会占满日志）。
+Leader 切换后通过宽限期机制即可恢复状态，代价仅为一个短暂的窗口期（10s）内
+不进行失联检测，对系统可用性影响极小。
+
 **优雅下线**：
 
 1. 管理员通过 Console 发起 Drain（排空）

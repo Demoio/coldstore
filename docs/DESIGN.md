@@ -643,14 +643,24 @@ src/tape/
 9. Client: GET 从 SPDK 缓存返回数据
 ```
 
-### 7.2 Archive 完整流程
+### 7.2 PutObject 完整流程
 
 ```
-1. PutObject → 对象直接标记 ColdPending（写入即归档）
-2. Archive Scheduler: 扫描 ColdPending，按策略聚合为 ArchiveBundle
-3. Tape: 顺序写入磁带
-4. Metadata (Raft): 写入 ArchiveBundle, 更新 ObjectMetadata (Cold, archive_id, tape_id)
-5. 清理缓存层临时数据
+1. Gateway: 接收 S3 PutObject 请求
+2. Scheduler Worker: 将数据暂存到 Cache Worker (gRPC: PutStaging)
+3. Scheduler Worker: 写入 Metadata (Raft: PutObject, storage_class=ColdPending, staging_id)
+4. Gateway: 返回 200 OK
+```
+
+### 7.3 Archive 完整流程
+
+```
+1. Archive Scheduler: 扫描 ColdPending 对象，获取 staging_id
+2. Archive Scheduler: 从 Cache Worker 暂存区读取数据 (gRPC: GetStaging)
+3. Archive Scheduler: 按策略聚合为 ArchiveBundle
+4. Tape: 顺序写入磁带
+5. Metadata (Raft): 写入 ArchiveBundle, 更新 ObjectMetadata (Cold, archive_id, tape_id, 清空 staging_id)
+6. Cache Worker: 删除暂存数据 (gRPC: DeleteStaging)
 ```
 
 ---

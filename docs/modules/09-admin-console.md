@@ -22,6 +22,10 @@
 
 ### 1.2 在架构中的位置
 
+Console **仅连接 Metadata 集群**，不直连 Scheduler Worker、Cache Worker 或 Tape Worker。
+所有运行时数据（缓存统计、驱动状态、队列深度等）由各 Worker 通过心跳上报到 Metadata，
+Console 从 Metadata 读取。
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                     浏览器 (Admin Console)                        │
@@ -33,7 +37,7 @@
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │              ColdStore Admin API (Axum :8080)                     │
-│  独立于 S3 API (:9000)，共享同一进程内的服务层                      │
+│  独立进程，仅连接 Metadata 集群                                    │
 │  ┌──────────┬───────────┬──────────┬──────────┬───────────┐    │
 │  │ /cluster │ /buckets  │ /objects │ /tapes   │ /tasks    │    │
 │  │ /drives  │ /cache    │ /metrics │ /audit   │ /config   │    │
@@ -41,10 +45,29 @@
 │              │                                                   │
 │              ▼                                                   │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  MetadataService │ TapeManager │ CacheManager │ Metrics  │  │
+│  │  MetadataClient (gRPC)                                    │  │
+│  │  所有数据来源于 Metadata 集群                                │  │
 │  └──────────────────────────────────────────────────────────┘  │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ gRPC (配置: metadata_addrs)
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Metadata 集群 (Raft + RocksDB)                                   │
+│  - 对象/桶/任务元数据                                              │
+│  - Worker 注册信息 + 心跳上报的运行时数据                            │
+│  - 磁带/驱动信息（由 Worker 心跳上报）                              │
+│  - 缓存统计（由 Cache Worker 心跳上报）                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+**关键设计决策**：
+
+- **Console 不直连任何 Worker**：与 DESIGN.md §2.1 保持一致，Console 仅连 Metadata
+- **运行时数据来源**：各 Worker 每 5s 心跳上报自身状态到 Metadata（参见 03-metadata-cluster §3.10.9），
+  包括缓存容量/命中率（CacheWorkerInfo）、驱动状态/当前磁带（TapeWorkerInfo）、
+  队列深度/活跃作业（SchedulerWorkerInfo）
+- **Console 读取路径**：Console Admin API 通过 MetadataClient 查询 Metadata 中的 Worker 信息，
+  获取缓存统计、磁带驱动状态等运行时数据
 
 ---
 
