@@ -1,0 +1,288 @@
+syntax = "proto3";
+package coldstore.metadata;
+
+import "common.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// ===========================================================================
+//  MetadataService — 元数据集群对外统一接口
+//
+//  消费方:
+//    - Scheduler Worker: 全部业务读写（唯一业务入口）
+//    - Console: 集群管理操作
+//    - 三类 Worker: 心跳注册
+// ===========================================================================
+service MetadataService {
+
+  // ── ObjectApi ──
+
+  rpc PutObject(coldstore.common.ObjectMetadata) returns (google.protobuf.Empty);
+  rpc GetObject(GetObjectRequest) returns (coldstore.common.ObjectMetadata);
+  rpc GetObjectVersion(GetObjectVersionRequest) returns (coldstore.common.ObjectMetadata);
+  rpc DeleteObject(DeleteObjectRequest) returns (google.protobuf.Empty);
+  rpc HeadObject(HeadObjectRequest) returns (coldstore.common.ObjectMetadata);
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc UpdateStorageClass(UpdateStorageClassRequest) returns (google.protobuf.Empty);
+  rpc UpdateArchiveLocation(UpdateArchiveLocationRequest) returns (google.protobuf.Empty);
+  rpc UpdateRestoreStatus(UpdateRestoreStatusRequest) returns (google.protobuf.Empty);
+  rpc ScanColdPending(ScanColdPendingRequest) returns (ScanColdPendingResponse);
+
+  // ── BucketApi ──
+
+  rpc CreateBucket(coldstore.common.BucketInfo) returns (google.protobuf.Empty);
+  rpc GetBucket(GetBucketRequest) returns (coldstore.common.BucketInfo);
+  rpc DeleteBucket(DeleteBucketRequest) returns (google.protobuf.Empty);
+  rpc ListBuckets(google.protobuf.Empty) returns (ListBucketsResponse);
+
+  // ── ArchiveApi ──
+
+  rpc PutArchiveBundle(coldstore.common.ArchiveBundle) returns (google.protobuf.Empty);
+  rpc GetArchiveBundle(GetArchiveBundleRequest) returns (coldstore.common.ArchiveBundle);
+  rpc UpdateArchiveBundleStatus(UpdateArchiveBundleStatusRequest) returns (google.protobuf.Empty);
+  rpc ListBundlesByTape(ListBundlesByTapeRequest) returns (ListBundlesByTapeResponse);
+  rpc PutArchiveTask(coldstore.common.ArchiveTask) returns (google.protobuf.Empty);
+  rpc GetArchiveTask(GetArchiveTaskRequest) returns (coldstore.common.ArchiveTask);
+  rpc UpdateArchiveTask(coldstore.common.ArchiveTask) returns (google.protobuf.Empty);
+  rpc ListPendingArchiveTasks(google.protobuf.Empty) returns (ListArchiveTasksResponse);
+
+  // ── RecallApi ──
+
+  rpc PutRecallTask(coldstore.common.RecallTask) returns (google.protobuf.Empty);
+  rpc GetRecallTask(GetRecallTaskRequest) returns (coldstore.common.RecallTask);
+  rpc UpdateRecallTask(coldstore.common.RecallTask) returns (google.protobuf.Empty);
+  rpc ListPendingRecallTasks(google.protobuf.Empty) returns (ListRecallTasksResponse);
+  rpc ListRecallTasksByTape(ListRecallTasksByTapeRequest) returns (ListRecallTasksResponse);
+  rpc FindActiveRecall(FindActiveRecallRequest) returns (FindActiveRecallResponse);
+
+  // ── TapeApi ──
+
+  rpc PutTape(coldstore.common.TapeInfo) returns (google.protobuf.Empty);
+  rpc GetTape(GetTapeRequest) returns (coldstore.common.TapeInfo);
+  rpc UpdateTape(coldstore.common.TapeInfo) returns (google.protobuf.Empty);
+  rpc ListTapes(google.protobuf.Empty) returns (ListTapesResponse);
+  rpc ListTapesByStatus(ListTapesByStatusRequest) returns (ListTapesResponse);
+
+  // ── ClusterApi ──
+
+  rpc GetClusterInfo(google.protobuf.Empty) returns (coldstore.common.ClusterInfo);
+  rpc RegisterSchedulerWorker(coldstore.common.SchedulerWorkerInfo) returns (google.protobuf.Empty);
+  rpc DeregisterSchedulerWorker(DeregisterWorkerRequest) returns (google.protobuf.Empty);
+  rpc ListOnlineSchedulerWorkers(google.protobuf.Empty) returns (ListSchedulerWorkersResponse);
+  rpc RegisterCacheWorker(coldstore.common.CacheWorkerInfo) returns (google.protobuf.Empty);
+  rpc DeregisterCacheWorker(DeregisterWorkerRequest) returns (google.protobuf.Empty);
+  rpc ListOnlineCacheWorkers(google.protobuf.Empty) returns (ListCacheWorkersResponse);
+  rpc RegisterTapeWorker(coldstore.common.TapeWorkerInfo) returns (google.protobuf.Empty);
+  rpc DeregisterTapeWorker(DeregisterWorkerRequest) returns (google.protobuf.Empty);
+  rpc ListOnlineTapeWorkers(google.protobuf.Empty) returns (ListTapeWorkersResponse);
+  rpc UpdateWorkerStatus(UpdateWorkerStatusRequest) returns (google.protobuf.Empty);
+  rpc DrainWorker(DrainWorkerRequest) returns (google.protobuf.Empty);
+
+  // ── HeartbeatApi ──
+
+  rpc Heartbeat(HeartbeatRequest) returns (google.protobuf.Empty);
+}
+
+// ---------------------------------------------------------------------------
+//  Request / Response 消息
+// ---------------------------------------------------------------------------
+
+// Object
+
+message GetObjectRequest {
+  string bucket = 1;
+  string key = 2;
+}
+
+message GetObjectVersionRequest {
+  string bucket = 1;
+  string key = 2;
+  string version_id = 3;
+}
+
+message DeleteObjectRequest {
+  string bucket = 1;
+  string key = 2;
+}
+
+message HeadObjectRequest {
+  string bucket = 1;
+  string key = 2;
+}
+
+message ListObjectsRequest {
+  string bucket = 1;
+  optional string prefix = 2;
+  optional string marker = 3;
+  uint32 max_keys = 4;
+}
+
+message ListObjectsResponse {
+  repeated coldstore.common.ObjectMetadata objects = 1;
+  optional string next_marker = 2;
+  bool is_truncated = 3;
+}
+
+message UpdateStorageClassRequest {
+  string bucket = 1;
+  string key = 2;
+  coldstore.common.StorageClass storage_class = 3;
+}
+
+message UpdateArchiveLocationRequest {
+  string bucket = 1;
+  string key = 2;
+  string archive_id = 3;
+  string tape_id = 4;
+  repeated string tape_set = 5;
+  uint64 tape_block_offset = 6;
+}
+
+message UpdateRestoreStatusRequest {
+  string bucket = 1;
+  string key = 2;
+  coldstore.common.RestoreStatus status = 3;
+  optional google.protobuf.Timestamp expire_at = 4;
+}
+
+message ScanColdPendingRequest {
+  uint32 limit = 1;
+}
+
+message ScanColdPendingResponse {
+  repeated coldstore.common.ObjectMetadata objects = 1;
+}
+
+// Bucket
+
+message GetBucketRequest {
+  string name = 1;
+}
+
+message DeleteBucketRequest {
+  string name = 1;
+}
+
+message ListBucketsResponse {
+  repeated coldstore.common.BucketInfo buckets = 1;
+}
+
+// Archive
+
+message GetArchiveBundleRequest {
+  string id = 1;
+}
+
+message UpdateArchiveBundleStatusRequest {
+  string id = 1;
+  coldstore.common.ArchiveBundleStatus status = 2;
+}
+
+message ListBundlesByTapeRequest {
+  string tape_id = 1;
+}
+
+message ListBundlesByTapeResponse {
+  repeated string bundle_ids = 1;
+}
+
+message GetArchiveTaskRequest {
+  string id = 1;
+}
+
+message ListArchiveTasksResponse {
+  repeated coldstore.common.ArchiveTask tasks = 1;
+}
+
+// Recall
+
+message GetRecallTaskRequest {
+  string id = 1;
+}
+
+message ListRecallTasksByTapeRequest {
+  string tape_id = 1;
+}
+
+message ListRecallTasksResponse {
+  repeated coldstore.common.RecallTask tasks = 1;
+}
+
+message FindActiveRecallRequest {
+  string bucket = 1;
+  string key = 2;
+}
+
+message FindActiveRecallResponse {
+  optional coldstore.common.RecallTask task = 1;
+}
+
+// Tape
+
+message GetTapeRequest {
+  string tape_id = 1;
+}
+
+message ListTapesResponse {
+  repeated coldstore.common.TapeInfo tapes = 1;
+}
+
+message ListTapesByStatusRequest {
+  coldstore.common.TapeStatus status = 1;
+}
+
+// Cluster
+
+message DeregisterWorkerRequest {
+  uint64 node_id = 1;
+}
+
+message ListSchedulerWorkersResponse {
+  repeated coldstore.common.SchedulerWorkerInfo workers = 1;
+}
+
+message ListCacheWorkersResponse {
+  repeated coldstore.common.CacheWorkerInfo workers = 1;
+}
+
+message ListTapeWorkersResponse {
+  repeated coldstore.common.TapeWorkerInfo workers = 1;
+}
+
+message UpdateWorkerStatusRequest {
+  coldstore.common.WorkerType worker_type = 1;
+  uint64 node_id = 2;
+  coldstore.common.NodeStatus status = 3;
+}
+
+message DrainWorkerRequest {
+  coldstore.common.WorkerType worker_type = 1;
+  uint64 node_id = 2;
+}
+
+// Heartbeat
+
+message HeartbeatRequest {
+  coldstore.common.WorkerType worker_type = 1;
+  uint64 node_id = 2;
+  oneof payload {
+    SchedulerHeartbeat scheduler = 3;
+    CacheHeartbeat cache = 4;
+    TapeHeartbeat tape = 5;
+  }
+}
+
+message SchedulerHeartbeat {
+  uint64 pending_archive_tasks = 1;
+  uint64 pending_recall_tasks = 2;
+  uint64 active_jobs = 3;
+}
+
+message CacheHeartbeat {
+  uint64 used_capacity = 1;
+  uint64 blob_count = 2;
+}
+
+message TapeHeartbeat {
+  repeated coldstore.common.DriveEndpoint drives = 1;
+}

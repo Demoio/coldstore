@@ -6,7 +6,7 @@ As object storage systems continue to grow in scale, the cost and energy consump
 
 The goal of this project is to build a system that is:
 
-> **S3‑compatible, tape‑backed, and capable of automatic hot/cold tiering and on‑demand restore (thawing)**
+> **S3‑compatible, tape‑backed pure cold archive with on‑demand restore (thawing)**
 
 The system targets government, enterprise, research, finance, and media workloads that require low cost, long‑term retention, and high reliability.
 
@@ -15,7 +15,7 @@ The system targets government, enterprise, research, finance, and media workload
 ## 2. Design Goals
 
 * Maintain full S3 protocol transparency for upper‑layer applications, requiring no business logic changes
-* Support automatic migration of object data to tape and other cold storage media
+* All PutObject writes immediately queue for archival to tape
 * Provide controllable, observable, and extensible restore and rehydration capabilities
 * Support enterprise‑grade archive workflows involving offline tapes and human intervention
 * Achieve a practical engineering balance among performance, capacity, and reliability
@@ -34,11 +34,7 @@ The system targets government, enterprise, research, finance, and media workload
 
 ### 3.2 Automatic Cold Data Tiering and Archival
 
-Support policy‑based migration of object data from general‑purpose storage to cold storage media:
-
-* Lifecycle rules (time‑based)
-* Access frequency (hot/cold identification)
-* Object tags or bucket‑level policies
+All objects written via PutObject are immediately marked as ColdPending and queued for archival to tape. ColdStore does not manage lifecycle policies—the decision of when to archive is made by the external hot storage system.
 
 After archival:
 
@@ -144,7 +140,7 @@ Reliability and storage efficiency are configurable trade‑offs.
 The system adopts a layered, decoupled architecture:
 
 * **S3 Access Layer**: External object access interface
-* **Metadata & Policy Management Layer**: Hot/cold state, lifecycle, and indexing
+* **Metadata & Policy Management Layer**: Cold state and indexing
 * **Tiering & Scheduling Layer**: Core archival and restore orchestration
 * **Cache Layer**: Online cache for restored data
 * **Tape Management Layer**: Unified abstraction for tapes, drives, and libraries
@@ -158,17 +154,17 @@ The system adopts a layered, decoupled architecture:
 
 * Handles PUT / GET / HEAD requests
 * Intercepts access to cold objects and evaluates state
-* Can be implemented via MinIO or a custom S3 proxy
+* Implemented via custom Axum S3 gateway
 
 #### Metadata Service
 
-* Maintains object hot/cold state and archive locations
+* Maintains object cold state and archive locations
 * Manages tape indexing and restore state machines
-* Metadata is always stored on online storage (KV / RDB)
+* Metadata is always stored on online storage (OpenRaft + RocksDB)
 
 #### Archive Scheduler
 
-* Scans objects eligible for archival
+* Processes ColdPending objects queued for archival
 * Performs batch aggregation and sequential tape writes
 * Coordinates tape drives for write operations
 
@@ -196,10 +192,10 @@ The system adopts a layered, decoupled architecture:
 
 ### 5.1 Cold Data Archival Flow
 
-1. Object is written via S3
-2. Lifecycle policy is triggered
+1. Object is written via S3 (PutObject)
+2. Object is immediately marked as ColdPending and queued for archival
 3. Scheduler aggregates objects and writes them to tape
-4. Metadata hot/cold state is updated
+4. Metadata cold state is updated (ColdPending → Cold)
 5. Online storage space is reclaimed
 
 ### 5.2 Cold Data Restore Flow
@@ -230,10 +226,10 @@ This section translates the design into an implementable architecture using obje
 
 | Layer        | Technology                   | Description                                       |
 | ------------ | ---------------------------- | ------------------------------------------------- |
-| S3 Access    | MinIO / RustFS               | S3‑compatible API, PUT/GET/HEAD/Restore semantics |
-| Metadata     | KV / RDB (etcd / PostgreSQL) | Hot/cold state, tape index, task state            |
+| S3 Access    | Axum (custom S3 gateway)     | S3‑compatible API, PUT/GET/HEAD/Restore semantics |
+| Metadata     | OpenRaft + RocksDB           | Cold state, tape index, task state                |
 | Scheduling   | Custom Scheduler (Rust)      | Core archive and recall logic                     |
-| Cache        | Local SSD / HDD + LRU        | Restored data cache                               |
+| Cache        | SPDK Blobstore (NVMe) / HDD  | Restored data cache                               |
 | Tape Access  | LTFS / Vendor SDK / SCSI     | LTO‑9 / LTO‑10 integration                        |
 | Notification | Webhook / MQ / Ticketing     | Human collaboration                               |
 
@@ -243,14 +239,11 @@ This section translates the design into an implementable architecture using obje
 
 #### 7.2.1 Cold Object Access Control
 
+ColdStore is a pure cold archive: all PutObject writes go to ColdPending state immediately. There is no Hot/Warm storage.
+
 * After archival, only metadata and placeholders remain online
 * Regular GET on cold objects returns an S3‑like `InvalidObjectState`
 * RestoreObject or extended APIs trigger recall scheduling
-
-This can be implemented via:
-
-* MinIO Lifecycle / ILM extensions, or
-* Direct integration into RustFS object access paths
 
 ---
 
@@ -259,7 +252,7 @@ This can be implemented via:
 #### 7.3.1 Object Metadata
 
 * bucket / object / version
-* `storage_class`: HOT / WARM / COLD
+* `storage_class`: ColdPending / Cold
 * `archive_id` (archive bundle ID)
 * `tape_id` / `tape_set`
 * checksum / size
@@ -280,8 +273,8 @@ This can be implemented via:
 
 **Write Path**
 
-1. Object written to MinIO / RustFS
-2. Lifecycle policy marks it as `COLD_PENDING`
+1. Object written via PutObject
+2. Immediately marked as ColdPending and queued for archival
 3. Archive Scheduler aggregates objects
 4. Sequential tape write (≥ 300 MB/s)
 5. Metadata updated and online data released
@@ -355,8 +348,8 @@ This can be implemented via:
 
 ### 7.10 Reusable and Replaceable Components
 
-* S3: MinIO / RustFS
-* Metadata: etcd / PostgreSQL
+* S3: Custom Axum gateway
+* Metadata: OpenRaft + RocksDB
 * Notification: Existing ticketing / alert systems
 * Tape drivers: Vendor SDKs
 

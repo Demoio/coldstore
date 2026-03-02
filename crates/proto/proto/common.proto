@@ -1,0 +1,262 @@
+syntax = "proto3";
+package coldstore.common;
+
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+//  枚举类型
+// ---------------------------------------------------------------------------
+
+enum StorageClass {
+  STORAGE_CLASS_UNSPECIFIED = 0;
+  COLD_PENDING = 1;   // 写入即排队归档
+  COLD = 2;           // 已归档到磁带
+}
+
+enum RestoreStatus {
+  RESTORE_STATUS_UNSPECIFIED = 0;
+  RESTORE_PENDING = 1;
+  RESTORE_WAITING_FOR_MEDIA = 2;
+  RESTORE_IN_PROGRESS = 3;
+  RESTORE_COMPLETED = 4;
+  RESTORE_EXPIRED = 5;
+  RESTORE_FAILED = 6;
+}
+
+enum RestoreTier {
+  RESTORE_TIER_UNSPECIFIED = 0;
+  EXPEDITED = 1;
+  STANDARD = 2;
+  BULK = 3;
+}
+
+enum TapeStatus {
+  TAPE_STATUS_UNSPECIFIED = 0;
+  TAPE_ONLINE = 1;
+  TAPE_OFFLINE = 2;
+  TAPE_ERROR = 3;
+  TAPE_RETIRED = 4;
+  TAPE_UNKNOWN = 5;
+}
+
+enum DriveStatus {
+  DRIVE_STATUS_UNSPECIFIED = 0;
+  DRIVE_IDLE = 1;
+  DRIVE_IN_USE = 2;
+  DRIVE_LOADING = 3;
+  DRIVE_UNLOADING = 4;
+  DRIVE_ERROR = 5;
+  DRIVE_OFFLINE = 6;
+}
+
+enum NodeStatus {
+  NODE_STATUS_UNSPECIFIED = 0;
+  NODE_ONLINE = 1;
+  NODE_OFFLINE = 2;
+  NODE_DRAINING = 3;
+  NODE_MAINTENANCE = 4;
+}
+
+enum WorkerType {
+  WORKER_TYPE_UNSPECIFIED = 0;
+  WORKER_SCHEDULER = 1;
+  WORKER_CACHE = 2;
+  WORKER_TAPE = 3;
+}
+
+enum ArchiveBundleStatus {
+  ARCHIVE_BUNDLE_STATUS_UNSPECIFIED = 0;
+  BUNDLE_PENDING = 1;
+  BUNDLE_WRITING = 2;
+  BUNDLE_COMPLETED = 3;
+  BUNDLE_FAILED = 4;
+}
+
+enum ArchiveTaskStatus {
+  ARCHIVE_TASK_STATUS_UNSPECIFIED = 0;
+  ARCHIVE_TASK_PENDING = 1;
+  ARCHIVE_TASK_IN_PROGRESS = 2;
+  ARCHIVE_TASK_COMPLETED = 3;
+  ARCHIVE_TASK_FAILED = 4;
+}
+
+// ---------------------------------------------------------------------------
+//  核心数据结构
+// ---------------------------------------------------------------------------
+
+message ObjectMetadata {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+  uint64 size = 4;
+  string checksum = 5;
+  optional string content_type = 6;
+  optional string etag = 7;
+  StorageClass storage_class = 8;
+  optional string archive_id = 9;
+  optional string tape_id = 10;
+  repeated string tape_set = 11;
+  optional uint64 tape_block_offset = 12;
+  optional RestoreStatus restore_status = 13;
+  optional google.protobuf.Timestamp restore_expire_at = 14;
+  google.protobuf.Timestamp created_at = 15;
+  google.protobuf.Timestamp updated_at = 16;
+}
+
+message ArchiveBundle {
+  string id = 1;
+  string tape_id = 2;
+  repeated string tape_set = 3;
+  repeated BundleEntry entries = 4;
+  uint64 total_size = 5;
+  uint32 filemark_start = 6;
+  uint32 filemark_end = 7;
+  optional string checksum = 8;
+  ArchiveBundleStatus status = 9;
+  google.protobuf.Timestamp created_at = 10;
+  optional google.protobuf.Timestamp completed_at = 11;
+}
+
+message BundleEntry {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+  uint64 size = 4;
+  uint64 offset_in_bundle = 5;
+  uint64 tape_block_offset = 6;
+  string checksum = 7;
+}
+
+message TapeInfo {
+  string id = 1;
+  optional string barcode = 2;
+  string format = 3;
+  TapeStatus status = 4;
+  optional string location = 5;
+  uint64 capacity_bytes = 6;
+  uint64 used_bytes = 7;
+  uint64 remaining_bytes = 8;
+  repeated string archive_bundle_ids = 9;
+  optional google.protobuf.Timestamp last_verified_at = 10;
+  uint32 error_count = 11;
+  google.protobuf.Timestamp registered_at = 12;
+}
+
+message RecallTask {
+  string id = 1;
+  string bucket = 2;
+  string key = 3;
+  optional string version_id = 4;
+  string archive_id = 5;
+  string tape_id = 6;
+  repeated string tape_set = 7;
+  uint64 tape_block_offset = 8;
+  uint64 object_size = 9;
+  string checksum = 10;
+  RestoreTier tier = 11;
+  uint32 days = 12;
+  google.protobuf.Timestamp expire_at = 13;
+  RestoreStatus status = 14;
+  optional string drive_id = 15;
+  uint32 retry_count = 16;
+  google.protobuf.Timestamp created_at = 17;
+  optional google.protobuf.Timestamp started_at = 18;
+  optional google.protobuf.Timestamp completed_at = 19;
+  optional string error = 20;
+}
+
+message ArchiveTask {
+  string id = 1;
+  string bundle_id = 2;
+  string tape_id = 3;
+  optional string drive_id = 4;
+  uint32 object_count = 5;
+  uint64 total_size = 6;
+  uint64 bytes_written = 7;
+  ArchiveTaskStatus status = 8;
+  uint32 retry_count = 9;
+  google.protobuf.Timestamp created_at = 10;
+  optional google.protobuf.Timestamp started_at = 11;
+  optional google.protobuf.Timestamp completed_at = 12;
+  optional string error = 13;
+}
+
+message BucketInfo {
+  string name = 1;
+  google.protobuf.Timestamp created_at = 2;
+  optional string owner = 3;
+  bool versioning_enabled = 4;
+  uint64 object_count = 5;
+  uint64 total_size = 6;
+}
+
+// ---------------------------------------------------------------------------
+//  集群元数据
+// ---------------------------------------------------------------------------
+
+message SchedulerWorkerInfo {
+  uint64 node_id = 1;
+  string addr = 2;
+  NodeStatus status = 3;
+  optional google.protobuf.Timestamp last_heartbeat = 4;
+  bool is_active = 5;
+  uint64 pending_archive_tasks = 6;
+  uint64 pending_recall_tasks = 7;
+  uint64 active_jobs = 8;
+  uint64 paired_cache_worker_id = 9;
+}
+
+message CacheWorkerInfo {
+  uint64 node_id = 1;
+  string addr = 2;
+  NodeStatus status = 3;
+  optional google.protobuf.Timestamp last_heartbeat = 4;
+  string bdev_name = 5;
+  uint64 total_capacity = 6;
+  uint64 used_capacity = 7;
+  uint64 blob_count = 8;
+  uint32 io_unit_size = 9;
+}
+
+message TapeWorkerInfo {
+  uint64 node_id = 1;
+  string addr = 2;
+  NodeStatus status = 3;
+  optional google.protobuf.Timestamp last_heartbeat = 4;
+  repeated DriveEndpoint drives = 5;
+  optional LibraryEndpoint library = 6;
+}
+
+message DriveEndpoint {
+  string drive_id = 1;
+  string device_path = 2;
+  string drive_type = 3;
+  DriveStatus status = 4;
+  optional string current_tape = 5;
+}
+
+message LibraryEndpoint {
+  string device_path = 1;
+  uint32 slot_count = 2;
+  uint32 import_export_count = 3;
+  uint32 drive_count = 4;
+}
+
+message ClusterInfo {
+  string cluster_id = 1;
+  repeated MetadataNodeInfo metadata_nodes = 2;
+  repeated SchedulerWorkerInfo scheduler_workers = 3;
+  repeated CacheWorkerInfo cache_workers = 4;
+  repeated TapeWorkerInfo tape_workers = 5;
+  optional uint64 leader_id = 6;
+  uint64 term = 7;
+  uint64 committed_index = 8;
+}
+
+message MetadataNodeInfo {
+  uint64 node_id = 1;
+  string addr = 2;
+  string raft_role = 3;
+  optional google.protobuf.Timestamp last_heartbeat = 4;
+  NodeStatus status = 5;
+}

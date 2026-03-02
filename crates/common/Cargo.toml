@@ -1,0 +1,19 @@
+[package]
+name = "coldstore-common"
+description = "ColdStore shared types, models, and error handling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+coldstore-proto = { workspace = true }
+tonic = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+config = { workspace = true }
+prost-types = { workspace = true }
