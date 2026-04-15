@@ -17,10 +17,11 @@ impl HddBackend {
         fs::create_dir_all(base.join("staging")).await?;
         fs::create_dir_all(base.join("restored")).await?;
         fs::create_dir_all(base.join("meta")).await?;
+        let next_id = discover_next_id(&base).await?;
         Ok(Self {
             base_path: base,
             max_size_bytes: max_size_gb * 1024 * 1024 * 1024,
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(next_id),
         })
     }
 
@@ -134,6 +135,27 @@ impl CacheBackend for HddBackend {
     }
 
     async fn available_bytes(&self) -> Result<u64> {
-        Ok(self.max_size_bytes)
+        let used_bytes: u64 = self
+            .list_all()
+            .await?
+            .into_iter()
+            .map(|(_, x)| x.size)
+            .sum();
+        Ok(self.max_size_bytes.saturating_sub(used_bytes))
     }
+}
+
+async fn discover_next_id(base: &std::path::Path) -> Result<u64> {
+    let mut max_id = 0_u64;
+    let mut rd = fs::read_dir(base.join("meta")).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(raw) = name.strip_suffix(".json") {
+            if let Ok(id) = raw.parse::<u64>() {
+                max_id = max_id.max(id);
+            }
+        }
+    }
+    Ok(max_id + 1)
 }

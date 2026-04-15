@@ -10,8 +10,25 @@
 > **模块设计文档**：各层独立设计详见 [modules/](modules/) 目录。
 
 1. **协议层**：兼容 S3 冷归档协议（Glacier 语义）
-2. **集群元数据**：基于 [OpenRaft](https://github.com/databendlabs/openraft) + RocksDB 持久化
-3. **数据缓存层**：基于 [async-spdk](https://github.com/madsys-dev/async-spdk) 的高性能用户态缓存
+2. **集群元数据**：长期目标为 [OpenRaft](https://github.com/databendlabs/openraft) + RocksDB 持久化
+3. **数据缓存层**：长期目标为 [async-spdk](https://github.com/madsys-dev/async-spdk) 用户态高性能缓存
+
+### 1.1 当前实现分期与文档纠偏
+
+为了避免“设计已完整、实现仍是骨架”带来的偏差，本文档将系统能力分为两个层次：
+
+| 分期 | 状态 | 说明 |
+|------|------|------|
+| **Phase 1（当前代码基线）** | 已落地 / 可单测 | Metadata 使用内存状态机；Cache 使用 HDD 后端 + 进程内索引；Scheduler/Tape 对未完成路径返回显式 `UNIMPLEMENTED`；仅保证编译、静态检查与单元测试 |
+| **Phase 2（目标架构）** | 设计目标 | Metadata 切换到 OpenRaft + RocksDB；Cache 支持 SPDK；Tape 接入真实 SCSI/LTFS/厂商 SDK；补齐跨进程集成测试 |
+
+Phase 1 的设计原则：
+- 不访问真实磁带设备
+- 不启动真实分布式集群
+- 不执行会改变主机外部环境的集成测试
+- 先把协议对象、状态流转、缓存读写、元数据 CRUD 做成可验证的本地能力
+
+因此，本文档中凡涉及 Raft、RocksDB、SPDK、真实带库控制的内容，均视为 **目标态设计**；凡涉及内存版 Metadata、HDD Cache、显式 `UNIMPLEMENTED` 边界的内容，均视为 **当前实现态设计**。
 
 ### 1.1 核心技术选型（已确定）
 
@@ -98,8 +115,14 @@ Gateway 仅连接 Scheduler Worker，Console 仅连接 Metadata。
 
 ### 2.3 交互模式
 
-**Scheduler Worker 是唯一的元数据读写入口**（Console 管控除外）。
-Gateway、Cache Worker、Tape Worker 均不直接访问 Metadata。
+**目标态**中，Scheduler Worker 是唯一的元数据业务读写入口（Console 管控除外），Gateway、Cache Worker、Tape Worker 均不直接访问 Metadata。
+
+**当前实现态（Phase 1）**中，真正落地并可被单元测试验证的是：
+- MetadataService 的进程内内存状态机实现
+- CacheService 的 HDD 本地缓存实现
+- Scheduler/Tape 的显式未实现边界
+
+也就是说，当前代码基线验证的是“协议和状态语义正确性”，不是“完整分布式系统联调”。
 
 ```
                                 Console ──管控读写──▶ Metadata
@@ -220,9 +243,27 @@ ColdStore 是纯冷归档系统（类似 AWS Glacier Deep Archive），所有对
 
 ---
 
-## 4. 集群元数据：Raft + RocksDB 设计
+## 4. 集群元数据：Phase 1 当前实现与 Phase 2 目标设计
 
-### 4.1 设计目标
+### 4.0 当前实现态（Phase 1）
+
+当前代码中，MetadataService 采用内存状态机实现，提供以下可单测能力：
+- Bucket CRUD
+- Object CRUD / List / Head
+- StorageClass / RestoreStatus / ArchiveLocation 更新
+- ArchiveBundle / ArchiveTask / RecallTask / TapeInfo 的基础 CRUD
+- Worker 注册、状态更新与心跳
+- ClusterInfo 的静态/内存视图输出
+
+该实现的目的不是替代最终的分布式元数据集群，而是：
+- 提前冻结 protobuf 契约
+- 验证状态流转和对象模型
+- 为 Scheduler / Gateway / Console 后续对接提供稳定 mockable backend
+- 在不引入 RocksDB、Raft、网络联调的情况下保证核心语义可测
+
+### 4.1 目标设计（Phase 2）
+
+### 4.2 设计目标
 
 - **强一致性**：元数据读写通过 Raft 达成共识
 - **高可用**：多数节点存活即可服务
@@ -332,9 +373,26 @@ enum ColdStoreRequest {
 
 ---
 
-## 5. 数据缓存层：async-spdk 设计
+## 5. 数据缓存层：Phase 1 当前实现与 Phase 2 目标设计
 
-### 5.1 设计目标
+### 5.0 当前实现态（Phase 1）
+
+当前代码中，CacheService 先落地 HDD 后端，职责包括：
+- 暂存 PutObject 数据（staging）
+- 保存恢复后的 restored 数据
+- 通过进程内索引实现 Contains / Get / GetStaging / Delete / DeleteStaging / Stats
+- 启动时扫描本地元数据文件并重建索引
+
+当前实现明确不包含：
+- SPDK bdev / blobstore
+- 真正的缓存淘汰策略调度线程
+- 多节点缓存一致性
+
+当前阶段的核心目标是确保缓存协议、对象索引、流式读写与统计逻辑正确。
+
+### 5.1 目标设计（Phase 2）
+
+### 5.2 设计目标
 
 - **高性能**：用户态 I/O，绕过内核，降低延迟
 - **高吞吐**：Poll 模式、零拷贝，充分发挥 NVMe 性能
