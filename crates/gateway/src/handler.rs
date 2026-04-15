@@ -1,7 +1,7 @@
-use crate::protocol::{is_restore_request, S3ErrorCode, S3ErrorResponse};
+use crate::protocol::{format_restore_header, is_restore_request, S3ErrorCode, S3ErrorResponse};
 use crate::GatewayState;
 use axum::body::Body;
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::{
@@ -18,50 +18,37 @@ pub fn router(state: Arc<GatewayState>) -> Router {
 fn build_router() -> Router<Arc<GatewayState>> {
     Router::new()
         .route("/health", get(health))
-        .route("/", get(list_buckets_placeholder))
+        .route("/", get(list_buckets))
         .route(
             "/:bucket",
             put(create_bucket_placeholder)
                 .delete(delete_bucket_placeholder)
-                .head(head_bucket_placeholder),
+                .head(head_bucket),
         )
         .route(
             "/:bucket/*key",
             get(get_object_placeholder)
                 .put(put_object_placeholder)
                 .delete(delete_object_placeholder)
-                .head(head_object_placeholder)
+                .head(head_object)
                 .post(post_object_placeholder),
         )
 }
 
 #[cfg(test)]
-fn test_router() -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/", get(list_buckets_placeholder))
-        .route(
-            "/:bucket",
-            put(create_bucket_placeholder)
-                .delete(delete_bucket_placeholder)
-                .head(head_bucket_placeholder),
-        )
-        .route(
-            "/:bucket/*key",
-            get(get_object_placeholder)
-                .put(put_object_placeholder)
-                .delete(delete_object_placeholder)
-                .head(head_object_placeholder)
-                .post(post_object_placeholder),
-        )
+fn test_router(state: Arc<GatewayState>) -> Router {
+    build_router().with_state(state)
 }
 
 async fn health() -> &'static str {
     "OK"
 }
 
-async fn list_buckets_placeholder() -> Response {
-    not_implemented_response("ListBuckets", "/")
+async fn list_buckets(State(state): State<Arc<GatewayState>>) -> Response {
+    match state.backend.list_buckets().await {
+        Ok(response) => list_buckets_xml_response(&response),
+        Err(status) => grpc_status_to_s3_response(status, "/"),
+    }
 }
 
 async fn create_bucket_placeholder(Path(bucket): Path<String>) -> Response {
@@ -72,8 +59,14 @@ async fn delete_bucket_placeholder(Path(bucket): Path<String>) -> Response {
     not_implemented_response("DeleteBucket", &format!("/{bucket}"))
 }
 
-async fn head_bucket_placeholder(Path(bucket): Path<String>) -> Response {
-    not_implemented_response("HeadBucket", &format!("/{bucket}"))
+async fn head_bucket(
+    State(state): State<Arc<GatewayState>>,
+    Path(bucket): Path<String>,
+) -> Response {
+    match state.backend.head_bucket(&bucket).await {
+        Ok(()) => empty_response(StatusCode::OK),
+        Err(status) => grpc_status_to_s3_response(status, &format!("/{bucket}")),
+    }
 }
 
 async fn get_object_placeholder(Path((bucket, key)): Path<(String, String)>) -> Response {
@@ -88,8 +81,14 @@ async fn delete_object_placeholder(Path((bucket, key)): Path<(String, String)>) 
     not_implemented_response("DeleteObject", &format!("/{bucket}/{key}"))
 }
 
-async fn head_object_placeholder(Path((bucket, key)): Path<(String, String)>) -> Response {
-    not_implemented_response("HeadObject", &format!("/{bucket}/{key}"))
+async fn head_object(
+    State(state): State<Arc<GatewayState>>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Response {
+    match state.backend.head_object(&bucket, &key).await {
+        Ok(head) => head_object_success_response(head),
+        Err(status) => grpc_status_to_s3_response(status, &format!("/{bucket}/{key}")),
+    }
 }
 
 async fn post_object_placeholder(
@@ -121,12 +120,65 @@ async fn post_object_placeholder(
     }
 }
 
+fn list_buckets_xml_response(
+    response: &coldstore_proto::scheduler::ListBucketsResponse,
+) -> Response {
+    let buckets_xml = response
+        .buckets
+        .iter()
+        .map(|bucket| format!("<Bucket><Name>{}</Name></Bucket>", bucket.name))
+        .collect::<Vec<_>>()
+        .join("");
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListAllMyBucketsResult><Buckets>{}</Buckets></ListAllMyBucketsResult>",
+        buckets_xml
+    );
+    xml_response(StatusCode::OK, body)
+}
+
+fn head_object_success_response(head: coldstore_proto::scheduler::HeadObjectResponse) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&head.content_length.to_string()).unwrap(),
+    );
+    if let Some(content_type) = head.content_type {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_str(&content_type).unwrap(),
+        );
+    }
+    response.headers_mut().insert(
+        axum::http::header::ETAG,
+        HeaderValue::from_str(&head.etag).unwrap(),
+    );
+    if let Some(restore_info) = head.restore_info {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-amz-restore"),
+            HeaderValue::from_str(&normalize_restore_info(&restore_info)).unwrap(),
+        );
+    }
+    response
+}
+
+fn normalize_restore_info(restore_info: &str) -> String {
+    if let Some(expiry) = restore_info.strip_prefix("ongoing-request=\"false\", expiry-ts=\"") {
+        let expiry = expiry.trim_end_matches('"');
+        format_restore_header(false, Some(expiry))
+    } else if restore_info == "ongoing-request=\"false\"" {
+        format_restore_header(false, None)
+    } else {
+        format_restore_header(true, None)
+    }
+}
+
 fn not_implemented_response(operation: &str, resource: &str) -> Response {
+    let message =
+        format!("{operation} route skeleton is present but backend integration is not implemented");
     let body = S3ErrorResponse {
         code: S3ErrorCode::NotImplemented,
-        message: &format!(
-            "{operation} route skeleton is present but backend integration is not implemented"
-        ),
+        message: &message,
         resource,
     }
     .to_xml();
@@ -134,13 +186,36 @@ fn not_implemented_response(operation: &str, resource: &str) -> Response {
 }
 
 fn bad_request_response(operation: &str, resource: &str) -> Response {
+    let message = format!("unsupported POST action for {operation}");
     let body = S3ErrorResponse {
         code: S3ErrorCode::NotImplemented,
-        message: &format!("unsupported POST action for {operation}"),
+        message: &message,
         resource,
     }
     .to_xml();
     s3_xml_response(StatusCode::BAD_REQUEST, body)
+}
+
+fn grpc_status_to_s3_response(status: tonic::Status, resource: &str) -> Response {
+    let (code, http_status) = match status.code() {
+        tonic::Code::NotFound => {
+            let code = if resource.matches('/').count() > 1 {
+                S3ErrorCode::NoSuchKey
+            } else {
+                S3ErrorCode::NoSuchBucket
+            };
+            (code, StatusCode::NOT_FOUND)
+        }
+        tonic::Code::Unimplemented => (S3ErrorCode::NotImplemented, StatusCode::NOT_IMPLEMENTED),
+        _ => (S3ErrorCode::NotImplemented, StatusCode::BAD_GATEWAY),
+    };
+    let body = S3ErrorResponse {
+        code,
+        message: status.message(),
+        resource,
+    }
+    .to_xml();
+    s3_xml_response(http_status, body)
 }
 
 fn s3_xml_response(status: StatusCode, body: String) -> Response {
@@ -153,16 +228,77 @@ fn s3_xml_response(status: StatusCode, body: String) -> Response {
     response
 }
 
+fn xml_response(status: StatusCode, body: String) -> Response {
+    s3_xml_response(status, body)
+}
+
+fn empty_response(status: StatusCode) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = status;
+    response
+}
+
+use axum::http::header::HeaderName;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GatewayBackend;
     use axum::body::to_bytes;
     use axum::http::Request;
+    use coldstore_proto::scheduler::{BucketEntry, HeadObjectResponse, ListBucketsResponse};
     use tower::util::ServiceExt;
+
+    struct MockGatewayBackend;
+
+    #[tonic::async_trait]
+    impl GatewayBackend for MockGatewayBackend {
+        async fn list_buckets(&self) -> std::result::Result<ListBucketsResponse, tonic::Status> {
+            Ok(ListBucketsResponse {
+                buckets: vec![BucketEntry {
+                    name: "docs".into(),
+                    creation_date: None,
+                }],
+            })
+        }
+
+        async fn head_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status> {
+            if bucket == "docs" {
+                Ok(())
+            } else {
+                Err(tonic::Status::not_found("bucket missing"))
+            }
+        }
+
+        async fn head_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> std::result::Result<HeadObjectResponse, tonic::Status> {
+            if bucket == "docs" && key == "readme.txt" {
+                Ok(HeadObjectResponse {
+                    content_length: 42,
+                    content_type: Some("text/plain".into()),
+                    etag: "etag-1".into(),
+                    storage_class: 2,
+                    restore_info: Some("ongoing-request=\"false\", expiry-ts=\"123\"".into()),
+                    last_modified: None,
+                })
+            } else {
+                Err(tonic::Status::not_found("object missing"))
+            }
+        }
+    }
+
+    fn state() -> Arc<GatewayState> {
+        Arc::new(GatewayState {
+            backend: Arc::new(MockGatewayBackend),
+        })
+    }
 
     #[tokio::test]
     async fn health_route_returns_ok() {
-        let response = test_router()
+        let response = test_router(state())
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -175,21 +311,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_buckets_route_returns_not_implemented_xml() {
-        let response = test_router()
+    async fn list_buckets_route_returns_xml_from_backend() {
+        let response = test_router(state())
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("<Code>NotImplemented</Code>"));
-        assert!(body.contains("ListBuckets"));
+        assert!(body.contains("<Name>docs</Name>"));
     }
 
     #[tokio::test]
     async fn restore_post_route_returns_not_implemented_xml() {
-        let response = test_router()
+        let response = test_router(state())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -206,8 +341,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_bucket_route_returns_not_implemented() {
-        let response = test_router()
+    async fn head_bucket_route_uses_backend() {
+        let response = test_router(state())
             .oneshot(
                 Request::builder()
                     .method("HEAD")
@@ -217,6 +352,26 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn head_object_route_sets_restore_header() {
+        let response = test_router(state())
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/docs/readme.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["etag"], "etag-1");
+        assert_eq!(
+            response.headers()["x-amz-restore"],
+            "ongoing-request=\"false\", expiry-date=\"123\""
+        );
     }
 }
