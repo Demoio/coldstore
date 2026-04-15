@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::RwLock;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 #[tonic::async_trait]
@@ -21,6 +23,11 @@ pub trait Phase1SchedulerBackend: Send + Sync + 'static {
         bucket: &str,
         key: &str,
     ) -> std::result::Result<common::ObjectMetadata, Status>;
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> std::result::Result<(common::ObjectMetadata, Vec<u8>), Status>;
     async fn list_objects(
         &self,
         bucket: &str,
@@ -37,19 +44,15 @@ impl Phase1SchedulerBackend for RemoteSchedulerBackend {
     async fn list_buckets(&self) -> std::result::Result<Vec<common::BucketInfo>, Status> {
         Err(phase1_unimplemented("scheduler.list_buckets"))
     }
-
     async fn create_bucket(&self, _bucket: &str) -> std::result::Result<(), Status> {
         Err(phase1_unimplemented("scheduler.create_bucket"))
     }
-
     async fn delete_bucket(&self, _bucket: &str) -> std::result::Result<(), Status> {
         Err(phase1_unimplemented("scheduler.delete_bucket"))
     }
-
     async fn head_bucket(&self, _bucket: &str) -> std::result::Result<(), Status> {
         Err(phase1_unimplemented("scheduler.head_bucket"))
     }
-
     async fn head_object(
         &self,
         _bucket: &str,
@@ -57,7 +60,13 @@ impl Phase1SchedulerBackend for RemoteSchedulerBackend {
     ) -> std::result::Result<common::ObjectMetadata, Status> {
         Err(phase1_unimplemented("scheduler.head_object"))
     }
-
+    async fn get_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+    ) -> std::result::Result<(common::ObjectMetadata, Vec<u8>), Status> {
+        Err(phase1_unimplemented("scheduler.get_object"))
+    }
     async fn list_objects(
         &self,
         _bucket: &str,
@@ -99,7 +108,6 @@ fn phase1_unimplemented(op: &str) -> Status {
     ))
 }
 
-#[allow(dead_code)]
 fn build_restore_info(
     restore_status: Option<i32>,
     restore_expire_at: Option<&Timestamp>,
@@ -124,7 +132,6 @@ fn build_restore_info(
     }
 }
 
-#[allow(dead_code)]
 fn build_head_object_response(object: &common::ObjectMetadata) -> HeadObjectResponse {
     HeadObjectResponse {
         content_length: object.size,
@@ -136,7 +143,17 @@ fn build_head_object_response(object: &common::ObjectMetadata) -> HeadObjectResp
     }
 }
 
-#[allow(dead_code)]
+fn build_get_object_meta(object: &common::ObjectMetadata) -> GetObjectMeta {
+    GetObjectMeta {
+        content_length: object.size,
+        content_type: object.content_type.clone(),
+        etag: object.etag.clone().unwrap_or_default(),
+        storage_class: object.storage_class,
+        restore_info: build_restore_info(object.restore_status, object.restore_expire_at.as_ref()),
+        last_modified: object.updated_at,
+    }
+}
+
 fn build_object_entry(object: &common::ObjectMetadata) -> ObjectEntry {
     ObjectEntry {
         key: object.key.clone(),
@@ -147,7 +164,6 @@ fn build_object_entry(object: &common::ObjectMetadata) -> ObjectEntry {
     }
 }
 
-#[allow(dead_code)]
 fn build_bucket_entry(bucket: &common::BucketInfo) -> BucketEntry {
     BucketEntry {
         name: bucket.name.clone(),
@@ -155,7 +171,6 @@ fn build_bucket_entry(bucket: &common::BucketInfo) -> BucketEntry {
     }
 }
 
-#[allow(dead_code)]
 fn storage_class_label(storage_class: i32) -> &'static str {
     match common::StorageClass::try_from(storage_class).ok() {
         Some(common::StorageClass::ColdPending) => "COLD_PENDING",
@@ -173,14 +188,33 @@ impl SchedulerService for SchedulerServiceImpl {
         Err(phase1_unimplemented("scheduler.put_object"))
     }
 
-    type GetObjectStream =
-        tokio_stream::wrappers::ReceiverStream<Result<GetObjectResponse, Status>>;
+    type GetObjectStream = ReceiverStream<Result<GetObjectResponse, Status>>;
 
     async fn get_object(
         &self,
-        _request: Request<GetObjectRequest>,
+        request: Request<GetObjectRequest>,
     ) -> std::result::Result<Response<Self::GetObjectStream>, Status> {
-        Err(phase1_unimplemented("scheduler.get_object"))
+        let request = request.into_inner();
+        let (object, data) = self
+            .backend
+            .get_object(&request.bucket, &request.key)
+            .await?;
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(GetObjectResponse {
+                    payload: Some(get_object_response::Payload::Meta(build_get_object_meta(
+                        &object,
+                    ))),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(GetObjectResponse {
+                    payload: Some(get_object_response::Payload::Data(data)),
+                }))
+                .await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn head_object(
@@ -255,8 +289,9 @@ impl SchedulerService for SchedulerServiceImpl {
         &self,
         request: Request<CreateBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        self.backend.create_bucket(&request.bucket).await?;
+        self.backend
+            .create_bucket(&request.into_inner().bucket)
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -264,8 +299,9 @@ impl SchedulerService for SchedulerServiceImpl {
         &self,
         request: Request<DeleteBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        self.backend.delete_bucket(&request.bucket).await?;
+        self.backend
+            .delete_bucket(&request.into_inner().bucket)
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -273,8 +309,9 @@ impl SchedulerService for SchedulerServiceImpl {
         &self,
         request: Request<HeadBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        self.backend.head_bucket(&request.bucket).await?;
+        self.backend
+            .head_bucket(&request.into_inner().bucket)
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -293,11 +330,12 @@ impl SchedulerService for SchedulerServiceImpl {
 mod tests {
     use super::*;
     use coldstore_common::config::SchedulerConfig;
+    use tokio_stream::StreamExt;
 
     #[derive(Default)]
     struct InMemoryBackend {
         buckets: RwLock<Vec<common::BucketInfo>>,
-        objects: RwLock<HashMap<String, common::ObjectMetadata>>,
+        objects: RwLock<HashMap<String, (common::ObjectMetadata, Vec<u8>)>>,
     }
 
     impl InMemoryBackend {
@@ -341,7 +379,7 @@ mod tests {
                 }),
             };
             let mut objects = HashMap::new();
-            objects.insert("docs/readme.txt".into(), object);
+            objects.insert("docs/readme.txt".into(), (object, b"hello world".to_vec()));
             Self {
                 buckets: RwLock::new(vec![bucket]),
                 objects: RwLock::new(objects),
@@ -354,7 +392,6 @@ mod tests {
         async fn list_buckets(&self) -> std::result::Result<Vec<common::BucketInfo>, Status> {
             Ok(self.buckets.read().unwrap().clone())
         }
-
         async fn create_bucket(&self, bucket: &str) -> std::result::Result<(), Status> {
             let mut buckets = self.buckets.write().unwrap();
             if buckets.iter().any(|b| b.name == bucket) {
@@ -370,7 +407,6 @@ mod tests {
             });
             Ok(())
         }
-
         async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), Status> {
             let mut buckets = self.buckets.write().unwrap();
             let before = buckets.len();
@@ -381,7 +417,6 @@ mod tests {
                 Ok(())
             }
         }
-
         async fn head_bucket(&self, bucket: &str) -> std::result::Result<(), Status> {
             if self
                 .buckets
@@ -395,7 +430,6 @@ mod tests {
                 Err(Status::not_found("bucket missing"))
             }
         }
-
         async fn head_object(
             &self,
             bucket: &str,
@@ -405,10 +439,21 @@ mod tests {
                 .read()
                 .unwrap()
                 .get(&format!("{bucket}/{key}"))
+                .map(|(o, _)| o.clone())
+                .ok_or_else(|| Status::not_found("object missing"))
+        }
+        async fn get_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> std::result::Result<(common::ObjectMetadata, Vec<u8>), Status> {
+            self.objects
+                .read()
+                .unwrap()
+                .get(&format!("{bucket}/{key}"))
                 .cloned()
                 .ok_or_else(|| Status::not_found("object missing"))
         }
-
         async fn list_objects(
             &self,
             bucket: &str,
@@ -423,10 +468,10 @@ mod tests {
                 .read()
                 .unwrap()
                 .values()
-                .filter(|object| object.bucket == bucket)
-                .filter(|object| object.key.starts_with(prefix))
-                .filter(|object| object.key.as_str() > marker)
-                .cloned()
+                .map(|(o, _)| o.clone())
+                .filter(|o| o.bucket == bucket)
+                .filter(|o| o.key.starts_with(prefix))
+                .filter(|o| o.key.as_str() > marker)
                 .collect();
             objects.sort_by(|a, b| a.key.cmp(&b.key));
             Ok(objects)
@@ -448,7 +493,7 @@ mod tests {
 
     #[test]
     fn helper_head_object_response_contains_restore_info() {
-        let object = InMemoryBackend::with_fixture()
+        let (object, _) = InMemoryBackend::with_fixture()
             .objects
             .read()
             .unwrap()
@@ -462,6 +507,29 @@ mod tests {
             response.restore_info.as_deref(),
             Some("ongoing-request=\"false\", expiry-ts=\"123\"")
         );
+    }
+
+    #[tokio::test]
+    async fn get_object_stream_uses_backend() {
+        let mut stream = service()
+            .get_object(Request::new(GetObjectRequest {
+                bucket: "docs".into(),
+                key: "readme.txt".into(),
+                version_id: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = stream.next().await.unwrap().unwrap();
+        match first.payload {
+            Some(get_object_response::Payload::Meta(meta)) => assert_eq!(meta.etag, "etag-1"),
+            _ => panic!("expected meta"),
+        }
+        let second = stream.next().await.unwrap().unwrap();
+        match second.payload {
+            Some(get_object_response::Payload::Data(bytes)) => assert_eq!(bytes, b"hello world"),
+            _ => panic!("expected data"),
+        }
     }
 
     #[tokio::test]
@@ -509,12 +577,12 @@ mod tests {
 
     #[tokio::test]
     async fn head_bucket_uses_backend() {
-        let response = service()
+        assert!(service()
             .head_bucket(Request::new(HeadBucketRequest {
-                bucket: "docs".into(),
+                bucket: "docs".into()
             }))
-            .await;
-        assert!(response.is_ok());
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

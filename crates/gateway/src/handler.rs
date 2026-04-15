@@ -1,5 +1,5 @@
 use crate::protocol::{format_restore_header, is_restore_request, S3ErrorCode, S3ErrorResponse};
-use crate::GatewayState;
+use crate::{DownloadedObject, GatewayState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header::HeaderName, HeaderValue, StatusCode};
@@ -25,7 +25,7 @@ fn build_router() -> Router<Arc<GatewayState>> {
         )
         .route(
             "/:bucket/*key",
-            get(get_object_placeholder)
+            get(get_object)
                 .put(put_object_placeholder)
                 .delete(delete_object_placeholder)
                 .head(head_object)
@@ -101,8 +101,14 @@ async fn list_objects(
     }
 }
 
-async fn get_object_placeholder(Path((bucket, key)): Path<(String, String)>) -> Response {
-    not_implemented_response("GetObject", &format!("/{bucket}/{key}"))
+async fn get_object(
+    State(state): State<Arc<GatewayState>>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Response {
+    match state.backend.get_object(&bucket, &key).await {
+        Ok(object) => get_object_success_response(object),
+        Err(status) => grpc_status_to_s3_response(status, &format!("/{bucket}/{key}")),
+    }
 }
 
 async fn put_object_placeholder(Path((bucket, key)): Path<(String, String)>) -> Response {
@@ -189,36 +195,49 @@ fn list_objects_xml_response(
     xml_response(StatusCode::OK, body)
 }
 
+fn get_object_success_response(object: DownloadedObject) -> Response {
+    let mut response = Response::new(Body::from(object.body));
+    *response.status_mut() = StatusCode::OK;
+    apply_object_headers(response.headers_mut(), &object.head);
+    response
+}
+
 fn head_object_success_response(head: coldstore_proto::scheduler::HeadObjectResponse) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
+    apply_object_headers(response.headers_mut(), &head);
+    response
+}
+
+fn apply_object_headers(
+    headers: &mut axum::http::HeaderMap,
+    head: &coldstore_proto::scheduler::HeadObjectResponse,
+) {
+    headers.insert(
         axum::http::header::CONTENT_LENGTH,
         HeaderValue::from_str(&head.content_length.to_string()).unwrap(),
     );
-    if let Some(content_type) = head.content_type {
-        response.headers_mut().insert(
+    if let Some(content_type) = &head.content_type {
+        headers.insert(
             axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_str(&content_type).unwrap(),
+            HeaderValue::from_str(content_type).unwrap(),
         );
     }
-    response.headers_mut().insert(
+    headers.insert(
         axum::http::header::ETAG,
         HeaderValue::from_str(&head.etag).unwrap(),
     );
-    if let Some(restore_info) = head.restore_info {
-        response.headers_mut().insert(
+    if let Some(restore_info) = &head.restore_info {
+        headers.insert(
             HeaderName::from_static("x-amz-restore"),
-            HeaderValue::from_str(&normalize_restore_info(&restore_info)).unwrap(),
+            HeaderValue::from_str(&normalize_restore_info(restore_info)).unwrap(),
         );
     }
-    response
 }
 
 fn normalize_restore_info(restore_info: &str) -> String {
     if let Some(expiry) = restore_info.strip_prefix("ongoing-request=\"false\", expiry-ts=\"") {
-        let expiry = expiry.trim_end_matches('"');
-        format_restore_header(false, Some(expiry))
+        format_restore_header(false, Some(expiry.trim_end_matches('"')))
     } else if restore_info == "ongoing-request=\"false\"" {
         format_restore_header(false, None)
     } else {
@@ -387,6 +406,17 @@ mod tests {
                 Err(tonic::Status::not_found("object missing"))
             }
         }
+
+        async fn get_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> std::result::Result<DownloadedObject, tonic::Status> {
+            Ok(DownloadedObject {
+                head: self.head_object(bucket, key).await?,
+                body: b"hello world".to_vec(),
+            })
+        }
     }
 
     fn state() -> Arc<GatewayState> {
@@ -417,8 +447,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("<Name>docs</Name>"));
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("<Name>docs</Name>"));
     }
 
     #[tokio::test]
@@ -429,9 +460,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("<ListBucketResult>"));
-        assert!(body.contains("<Key>readme.txt</Key>"));
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("<ListBucketResult>"));
+        assert!(text.contains("<Key>readme.txt</Key>"));
     }
 
     #[tokio::test]
@@ -465,6 +496,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_object_route_returns_body_from_backend() {
+        let response = test_router(state())
+            .oneshot(
+                Request::builder()
+                    .uri("/docs/readme.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"hello world");
+    }
+
+    #[tokio::test]
     async fn restore_post_route_returns_not_implemented_xml() {
         let response = test_router(state())
             .oneshot(
@@ -478,8 +525,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("RestoreObject"));
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("RestoreObject"));
     }
 
     #[tokio::test]

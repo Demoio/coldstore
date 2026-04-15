@@ -12,6 +12,11 @@ use std::sync::Arc;
 use tonic::transport::Channel;
 use tracing::info;
 
+pub struct DownloadedObject {
+    pub head: HeadObjectResponse,
+    pub body: Vec<u8>,
+}
+
 #[tonic::async_trait]
 pub trait GatewayBackend: Send + Sync + 'static {
     async fn list_buckets(&self) -> std::result::Result<ListBucketsResponse, tonic::Status>;
@@ -31,6 +36,11 @@ pub trait GatewayBackend: Send + Sync + 'static {
         bucket: &str,
         key: &str,
     ) -> std::result::Result<HeadObjectResponse, tonic::Status>;
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> std::result::Result<DownloadedObject, tonic::Status>;
 }
 
 pub struct GrpcGatewayBackend {
@@ -121,6 +131,55 @@ impl GatewayBackend for GrpcGatewayBackend {
             })
             .await
             .map(|r| r.into_inner())
+    }
+
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> std::result::Result<DownloadedObject, tonic::Status> {
+        let mut client = self.connect().await?;
+        let mut stream = client
+            .get_object(coldstore_proto::scheduler::GetObjectRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: None,
+            })
+            .await?
+            .into_inner();
+
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| tonic::Status::internal("missing object metadata chunk"))?;
+        let head = match first.payload {
+            Some(coldstore_proto::scheduler::get_object_response::Payload::Meta(meta)) => {
+                HeadObjectResponse {
+                    content_length: meta.content_length,
+                    content_type: meta.content_type,
+                    etag: meta.etag,
+                    storage_class: meta.storage_class,
+                    restore_info: meta.restore_info,
+                    last_modified: meta.last_modified,
+                }
+            }
+            _ => {
+                return Err(tonic::Status::internal(
+                    "first object chunk was not metadata",
+                ))
+            }
+        };
+
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            if let Some(coldstore_proto::scheduler::get_object_response::Payload::Data(bytes)) =
+                chunk.payload
+            {
+                body.extend_from_slice(&bytes);
+            }
+        }
+
+        Ok(DownloadedObject { head, body })
     }
 }
 
