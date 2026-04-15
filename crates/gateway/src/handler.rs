@@ -2,12 +2,9 @@ use crate::protocol::{format_restore_header, is_restore_request, S3ErrorCode, S3
 use crate::GatewayState;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{header::HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
-use axum::{
-    routing::{get, put},
-    Router,
-};
+use axum::{routing::get, Router};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,8 +18,9 @@ fn build_router() -> Router<Arc<GatewayState>> {
         .route("/", get(list_buckets))
         .route(
             "/:bucket",
-            put(create_bucket_placeholder)
-                .delete(delete_bucket_placeholder)
+            get(list_objects)
+                .put(create_bucket)
+                .delete(delete_bucket)
                 .head(head_bucket),
         )
         .route(
@@ -51,12 +49,24 @@ async fn list_buckets(State(state): State<Arc<GatewayState>>) -> Response {
     }
 }
 
-async fn create_bucket_placeholder(Path(bucket): Path<String>) -> Response {
-    not_implemented_response("CreateBucket", &format!("/{bucket}"))
+async fn create_bucket(
+    State(state): State<Arc<GatewayState>>,
+    Path(bucket): Path<String>,
+) -> Response {
+    match state.backend.create_bucket(&bucket).await {
+        Ok(()) => empty_response(StatusCode::OK),
+        Err(status) => grpc_status_to_s3_response(status, &format!("/{bucket}")),
+    }
 }
 
-async fn delete_bucket_placeholder(Path(bucket): Path<String>) -> Response {
-    not_implemented_response("DeleteBucket", &format!("/{bucket}"))
+async fn delete_bucket(
+    State(state): State<Arc<GatewayState>>,
+    Path(bucket): Path<String>,
+) -> Response {
+    match state.backend.delete_bucket(&bucket).await {
+        Ok(()) => empty_response(StatusCode::NO_CONTENT),
+        Err(status) => grpc_status_to_s3_response(status, &format!("/{bucket}")),
+    }
 }
 
 async fn head_bucket(
@@ -65,6 +75,28 @@ async fn head_bucket(
 ) -> Response {
     match state.backend.head_bucket(&bucket).await {
         Ok(()) => empty_response(StatusCode::OK),
+        Err(status) => grpc_status_to_s3_response(status, &format!("/{bucket}")),
+    }
+}
+
+async fn list_objects(
+    State(state): State<Arc<GatewayState>>,
+    Path(bucket): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let prefix = query.get("prefix").map(String::as_str);
+    let marker = query.get("marker").map(String::as_str);
+    let delimiter = query.get("delimiter").map(String::as_str);
+    let max_keys = query
+        .get("max-keys")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1000);
+    match state
+        .backend
+        .list_objects(&bucket, prefix, marker, delimiter, max_keys)
+        .await
+    {
+        Ok(response) => list_objects_xml_response(&response),
         Err(status) => grpc_status_to_s3_response(status, &format!("/{bucket}")),
     }
 }
@@ -136,6 +168,27 @@ fn list_buckets_xml_response(
     xml_response(StatusCode::OK, body)
 }
 
+fn list_objects_xml_response(
+    response: &coldstore_proto::scheduler::ListObjectsResponse,
+) -> Response {
+    let contents = response
+        .contents
+        .iter()
+        .map(|entry| {
+            format!(
+                "<Contents><Key>{}</Key><ETag>{}</ETag><Size>{}</Size><StorageClass>{}</StorageClass></Contents>",
+                entry.key, entry.etag, entry.size, entry.storage_class
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>{}</Name>{}</ListBucketResult>",
+        response.bucket, contents
+    );
+    xml_response(StatusCode::OK, body)
+}
+
 fn head_object_success_response(head: coldstore_proto::scheduler::HeadObjectResponse) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::OK;
@@ -198,6 +251,7 @@ fn bad_request_response(operation: &str, resource: &str) -> Response {
 
 fn grpc_status_to_s3_response(status: tonic::Status, resource: &str) -> Response {
     let (code, http_status) = match status.code() {
+        tonic::Code::AlreadyExists => (S3ErrorCode::NotImplemented, StatusCode::CONFLICT),
         tonic::Code::NotFound => {
             let code = if resource.matches('/').count() > 1 {
                 S3ErrorCode::NoSuchKey
@@ -238,15 +292,15 @@ fn empty_response(status: StatusCode) -> Response {
     response
 }
 
-use axum::http::header::HeaderName;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::GatewayBackend;
     use axum::body::to_bytes;
     use axum::http::Request;
-    use coldstore_proto::scheduler::{BucketEntry, HeadObjectResponse, ListBucketsResponse};
+    use coldstore_proto::scheduler::{
+        BucketEntry, HeadObjectResponse, ListBucketsResponse, ListObjectsResponse, ObjectEntry,
+    };
     use tower::util::ServiceExt;
 
     struct MockGatewayBackend;
@@ -262,12 +316,57 @@ mod tests {
             })
         }
 
+        async fn create_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status> {
+            if bucket == "existing" {
+                Err(tonic::Status::already_exists("bucket already exists"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status> {
+            if bucket == "docs" {
+                Ok(())
+            } else {
+                Err(tonic::Status::not_found("bucket missing"))
+            }
+        }
+
         async fn head_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status> {
             if bucket == "docs" {
                 Ok(())
             } else {
                 Err(tonic::Status::not_found("bucket missing"))
             }
+        }
+
+        async fn list_objects(
+            &self,
+            bucket: &str,
+            _prefix: Option<&str>,
+            _marker: Option<&str>,
+            _delimiter: Option<&str>,
+            _max_keys: u32,
+        ) -> std::result::Result<ListObjectsResponse, tonic::Status> {
+            if bucket != "docs" {
+                return Err(tonic::Status::not_found("bucket missing"));
+            }
+            Ok(ListObjectsResponse {
+                bucket: "docs".into(),
+                prefix: None,
+                marker: None,
+                next_marker: None,
+                max_keys: 1000,
+                is_truncated: false,
+                contents: vec![ObjectEntry {
+                    key: "readme.txt".into(),
+                    last_modified: None,
+                    etag: "etag-1".into(),
+                    size: 42,
+                    storage_class: "COLD".into(),
+                }],
+                common_prefixes: vec![],
+            })
         }
 
         async fn head_object(
@@ -320,6 +419,49 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("<Name>docs</Name>"));
+    }
+
+    #[tokio::test]
+    async fn list_objects_route_returns_xml_from_backend() {
+        let response = test_router(state())
+            .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<ListBucketResult>"));
+        assert!(body.contains("<Key>readme.txt</Key>"));
+    }
+
+    #[tokio::test]
+    async fn create_bucket_route_uses_backend() {
+        let response = test_router(state())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/new-bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_route_uses_backend() {
+        let response = test_router(state())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/docs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
