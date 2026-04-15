@@ -14,17 +14,19 @@ impl SchedulerServiceImpl {
     }
 }
 
+fn phase1_unimplemented(op: &str) -> Status {
+    Status::unimplemented(format!(
+        "{op} is not implemented in phase-1 safe mode; use unit-tested metadata/cache services only"
+    ))
+}
+
 #[tonic::async_trait]
 impl SchedulerService for SchedulerServiceImpl {
     async fn put_object(
         &self,
         _request: Request<Streaming<PutObjectRequest>>,
     ) -> std::result::Result<Response<PutObjectResponse>, Status> {
-        // 1. 从 stream 接收元数据和数据
-        // 2. 写入 Metadata (PutObject, storage_class = ColdPending)
-        // 3. 将数据暂存到 Cache Worker (PutStaging)
-        // 4. 返回 ETag
-        todo!()
+        Err(phase1_unimplemented("scheduler.put_object"))
     }
 
     type GetObjectStream =
@@ -34,74 +36,62 @@ impl SchedulerService for SchedulerServiceImpl {
         &self,
         _request: Request<GetObjectRequest>,
     ) -> std::result::Result<Response<Self::GetObjectStream>, Status> {
-        // 1. 查询 Metadata (HeadObject)
-        // 2. 检查 storage_class 和 restore_status
-        // 3. 若 Cold + Completed: 从 Cache Worker 读取数据
-        // 4. 若 Cold + 未解冻: 返回 InvalidObjectState
-        // 5. Stream 返回数据
-        todo!()
+        Err(phase1_unimplemented("scheduler.get_object"))
     }
 
     async fn head_object(
         &self,
         _request: Request<HeadObjectRequest>,
     ) -> std::result::Result<Response<HeadObjectResponse>, Status> {
-        // 查询 Metadata, 生成 x-amz-restore 头信息
-        todo!()
+        Err(phase1_unimplemented("scheduler.head_object"))
     }
 
     async fn delete_object(
         &self,
         _request: Request<DeleteObjectRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        // 1. 删除 Metadata 中的对象
-        // 2. 清理 Cache Worker 中的缓存/暂存数据
-        todo!()
+        Err(phase1_unimplemented("scheduler.delete_object"))
     }
 
     async fn restore_object(
         &self,
         _request: Request<RestoreObjectRequest>,
     ) -> std::result::Result<Response<RestoreObjectResponse>, Status> {
-        // 1. 检查对象是否为 Cold 状态
-        // 2. 线性读检查是否已有进行中的 Restore
-        // 3. 创建 RecallTask 写入 Metadata
-        // 4. 返回 202 Accepted
-        todo!()
+        Err(phase1_unimplemented("scheduler.restore_object"))
     }
 
     async fn list_objects(
         &self,
         _request: Request<ListObjectsRequest>,
     ) -> std::result::Result<Response<ListObjectsResponse>, Status> {
-        todo!()
+        Err(phase1_unimplemented("scheduler.list_objects"))
     }
 
     async fn create_bucket(
         &self,
         _request: Request<CreateBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        todo!()
+        Err(phase1_unimplemented("scheduler.create_bucket"))
     }
 
     async fn delete_bucket(
         &self,
         _request: Request<DeleteBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        todo!()
+        Err(phase1_unimplemented("scheduler.delete_bucket"))
     }
 
     async fn head_bucket(
         &self,
         _request: Request<HeadBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        todo!()
+        Err(phase1_unimplemented("scheduler.head_bucket"))
     }
 
     async fn list_buckets(
         &self,
         _request: Request<()>,
     ) -> std::result::Result<Response<ListBucketsResponse>, Status> {
-        todo!()
+        Err(phase1_unimplemented("scheduler.list_buckets"))
     }
 }

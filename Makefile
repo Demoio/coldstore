@@ -1,4 +1,4 @@
-.PHONY: build fmt clippy test clean check help install-hooks lint
+.PHONY: build build-debug fmt fmt-check clippy test unit test-unit check check-all check-safe clean help install-hooks install-tools setup lint run-metadata run-gateway run-scheduler run-cache run-tape
 
 .DEFAULT_GOAL := help
 
@@ -18,10 +18,14 @@ fmt-check:
 clippy:
 	@cargo clippy --all-targets --all-features -- -D warnings
 test:
-	@cargo test --all-features
+	@cargo test --workspace --all-features
+unit test-unit:
+	@cargo test --workspace --lib --bins
 check:
 	@cargo check --all-targets --all-features
 check-all: fmt-check clippy test
+check-safe: fmt-check clippy unit build-debug
+	@echo "Safe verification passed (fmt/clippy/unit/build only)."
 clean:
 	@cargo clean
 
@@ -36,8 +40,8 @@ run-cache:
 run-tape:
 	@cargo run -p coldstore-tape
 
-lint: fmt-check clippy check test
-	@echo "All lint checks passed."
+lint: fmt-check clippy check unit
+	@echo "All lint checks passed (unit-only)."
 
 install-hooks:
 	@cp scripts/pre-commit .git/hooks/pre-commit
@@ -55,6 +59,6 @@ help:
 	@echo "ColdStore Workspace Makefile"
 	@echo ""
 	@echo "Build:   build build-debug clean"
-	@echo "Quality: fmt fmt-check clippy test check check-all lint"
+	@echo "Quality: fmt fmt-check clippy test unit check check-all check-safe lint"
 	@echo "Run:     run-metadata run-gateway run-scheduler run-cache run-tape"
 	@echo "Setup:   setup install-tools install-hooks"
