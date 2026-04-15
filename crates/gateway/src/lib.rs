@@ -3,10 +3,13 @@ pub mod protocol;
 
 use anyhow::Result;
 use coldstore_common::config::GatewayConfig;
+use coldstore_proto::common;
 use coldstore_proto::scheduler::scheduler_service_client::SchedulerServiceClient;
 use coldstore_proto::scheduler::{
-    CreateBucketRequest, DeleteBucketRequest, HeadBucketRequest, HeadObjectRequest,
-    HeadObjectResponse, ListBucketsResponse, ListObjectsRequest, ListObjectsResponse,
+    CreateBucketRequest, DeleteBucketRequest, DeleteObjectRequest, HeadBucketRequest,
+    HeadObjectRequest, HeadObjectResponse, ListBucketsResponse, ListObjectsRequest,
+    ListObjectsResponse, PutObjectMeta, PutObjectRequest, PutObjectResponse, RestoreObjectRequest,
+    RestoreObjectResponse,
 };
 use std::sync::Arc;
 use tonic::transport::Channel;
@@ -31,16 +34,35 @@ pub trait GatewayBackend: Send + Sync + 'static {
         delimiter: Option<&str>,
         max_keys: u32,
     ) -> std::result::Result<ListObjectsResponse, tonic::Status>;
-    async fn head_object(
+    async fn put_object(
         &self,
         bucket: &str,
         key: &str,
-    ) -> std::result::Result<HeadObjectResponse, tonic::Status>;
+        body: Vec<u8>,
+        content_type: Option<String>,
+    ) -> std::result::Result<PutObjectResponse, tonic::Status>;
     async fn get_object(
         &self,
         bucket: &str,
         key: &str,
     ) -> std::result::Result<DownloadedObject, tonic::Status>;
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> std::result::Result<(), tonic::Status>;
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> std::result::Result<HeadObjectResponse, tonic::Status>;
+    async fn restore_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        days: u32,
+        tier: common::RestoreTier,
+    ) -> std::result::Result<RestoreObjectResponse, tonic::Status>;
 }
 
 pub struct GrpcGatewayBackend {
@@ -117,20 +139,31 @@ impl GatewayBackend for GrpcGatewayBackend {
             .map(|r| r.into_inner())
     }
 
-    async fn head_object(
+    async fn put_object(
         &self,
         bucket: &str,
         key: &str,
-    ) -> std::result::Result<HeadObjectResponse, tonic::Status> {
+        body: Vec<u8>,
+        content_type: Option<String>,
+    ) -> std::result::Result<PutObjectResponse, tonic::Status> {
         let mut client = self.connect().await?;
-        client
-            .head_object(HeadObjectRequest {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: None,
-            })
-            .await
-            .map(|r| r.into_inner())
+        let stream = tokio_stream::iter(vec![
+            PutObjectRequest {
+                payload: Some(
+                    coldstore_proto::scheduler::put_object_request::Payload::Meta(PutObjectMeta {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        content_length: body.len() as u64,
+                        content_type,
+                        checksum_sha256: None,
+                    }),
+                ),
+            },
+            PutObjectRequest {
+                payload: Some(coldstore_proto::scheduler::put_object_request::Payload::Data(body)),
+            },
+        ]);
+        client.put_object(stream).await.map(|r| r.into_inner())
     }
 
     async fn get_object(
@@ -180,6 +213,58 @@ impl GatewayBackend for GrpcGatewayBackend {
         }
 
         Ok(DownloadedObject { head, body })
+    }
+
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> std::result::Result<(), tonic::Status> {
+        let mut client = self.connect().await?;
+        client
+            .delete_object(DeleteObjectRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: None,
+            })
+            .await
+            .map(|_| ())
+    }
+
+    async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> std::result::Result<HeadObjectResponse, tonic::Status> {
+        let mut client = self.connect().await?;
+        client
+            .head_object(HeadObjectRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: None,
+            })
+            .await
+            .map(|r| r.into_inner())
+    }
+
+    async fn restore_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        days: u32,
+        tier: common::RestoreTier,
+    ) -> std::result::Result<RestoreObjectResponse, tonic::Status> {
+        let mut client = self.connect().await?;
+        client
+            .restore_object(RestoreObjectRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: None,
+                days,
+                tier: tier as i32,
+            })
+            .await
+            .map(|r| r.into_inner())
     }
 }
 

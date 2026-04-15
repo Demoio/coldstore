@@ -28,6 +28,21 @@ pub trait Phase1SchedulerBackend: Send + Sync + 'static {
         bucket: &str,
         key: &str,
     ) -> std::result::Result<(common::ObjectMetadata, Vec<u8>), Status>;
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<String>,
+    ) -> std::result::Result<PutObjectResponse, Status>;
+    async fn delete_object(&self, bucket: &str, key: &str) -> std::result::Result<(), Status>;
+    async fn restore_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        days: u32,
+        tier: common::RestoreTier,
+    ) -> std::result::Result<RestoreObjectResponse, Status>;
     async fn list_objects(
         &self,
         bucket: &str,
@@ -66,6 +81,27 @@ impl Phase1SchedulerBackend for RemoteSchedulerBackend {
         _key: &str,
     ) -> std::result::Result<(common::ObjectMetadata, Vec<u8>), Status> {
         Err(phase1_unimplemented("scheduler.get_object"))
+    }
+    async fn put_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _body: Vec<u8>,
+        _content_type: Option<String>,
+    ) -> std::result::Result<PutObjectResponse, Status> {
+        Err(phase1_unimplemented("scheduler.put_object"))
+    }
+    async fn delete_object(&self, _bucket: &str, _key: &str) -> std::result::Result<(), Status> {
+        Err(phase1_unimplemented("scheduler.delete_object"))
+    }
+    async fn restore_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _days: u32,
+        _tier: common::RestoreTier,
+    ) -> std::result::Result<RestoreObjectResponse, Status> {
+        Err(phase1_unimplemented("scheduler.restore_object"))
     }
     async fn list_objects(
         &self,
@@ -183,9 +219,29 @@ fn storage_class_label(storage_class: i32) -> &'static str {
 impl SchedulerService for SchedulerServiceImpl {
     async fn put_object(
         &self,
-        _request: Request<Streaming<PutObjectRequest>>,
+        request: Request<Streaming<PutObjectRequest>>,
     ) -> std::result::Result<Response<PutObjectResponse>, Status> {
-        Err(phase1_unimplemented("scheduler.put_object"))
+        let mut stream = request.into_inner();
+        let mut meta: Option<PutObjectMeta> = None;
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            match chunk.payload {
+                Some(put_object_request::Payload::Meta(m)) => meta = Some(m),
+                Some(put_object_request::Payload::Data(bytes)) => body.extend_from_slice(&bytes),
+                None => return Err(Status::invalid_argument("empty put_object chunk")),
+            }
+        }
+        let meta = meta.ok_or_else(|| Status::invalid_argument("missing put_object metadata"))?;
+        if meta.content_length != body.len() as u64 {
+            return Err(Status::invalid_argument(
+                "content_length does not match body size",
+            ));
+        }
+        let response = self
+            .backend
+            .put_object(&meta.bucket, &meta.key, body, meta.content_type)
+            .await?;
+        Ok(Response::new(response))
     }
 
     type GetObjectStream = ReceiverStream<Result<GetObjectResponse, Status>>;
@@ -231,16 +287,27 @@ impl SchedulerService for SchedulerServiceImpl {
 
     async fn delete_object(
         &self,
-        _request: Request<DeleteObjectRequest>,
+        request: Request<DeleteObjectRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        Err(phase1_unimplemented("scheduler.delete_object"))
+        let request = request.into_inner();
+        self.backend
+            .delete_object(&request.bucket, &request.key)
+            .await?;
+        Ok(Response::new(()))
     }
 
     async fn restore_object(
         &self,
-        _request: Request<RestoreObjectRequest>,
+        request: Request<RestoreObjectRequest>,
     ) -> std::result::Result<Response<RestoreObjectResponse>, Status> {
-        Err(phase1_unimplemented("scheduler.restore_object"))
+        let request = request.into_inner();
+        let tier = common::RestoreTier::try_from(request.tier)
+            .map_err(|_| Status::invalid_argument("invalid restore tier"))?;
+        let response = self
+            .backend
+            .restore_object(&request.bucket, &request.key, request.days, tier)
+            .await?;
+        Ok(Response::new(response))
     }
 
     async fn list_objects(
@@ -454,6 +521,83 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| Status::not_found("object missing"))
         }
+        async fn put_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            body: Vec<u8>,
+            content_type: Option<String>,
+        ) -> std::result::Result<PutObjectResponse, Status> {
+            let object = common::ObjectMetadata {
+                bucket: bucket.into(),
+                key: key.into(),
+                version_id: None,
+                size: body.len() as u64,
+                checksum: "sum".into(),
+                content_type,
+                etag: Some("etag-put".into()),
+                storage_class: common::StorageClass::ColdPending as i32,
+                archive_id: None,
+                tape_id: None,
+                tape_set: vec![],
+                tape_block_offset: None,
+                restore_status: None,
+                restore_expire_at: None,
+                created_at: Some(Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                updated_at: Some(Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+            };
+            self.objects
+                .write()
+                .unwrap()
+                .insert(format!("{bucket}/{key}"), (object, body));
+            Ok(PutObjectResponse {
+                etag: "etag-put".into(),
+                version_id: "v1".into(),
+            })
+        }
+        async fn delete_object(&self, bucket: &str, key: &str) -> std::result::Result<(), Status> {
+            if self
+                .objects
+                .write()
+                .unwrap()
+                .remove(&format!("{bucket}/{key}"))
+                .is_some()
+            {
+                Ok(())
+            } else {
+                Err(Status::not_found("object missing"))
+            }
+        }
+        async fn restore_object(
+            &self,
+            bucket: &str,
+            key: &str,
+            _days: u32,
+            _tier: common::RestoreTier,
+        ) -> std::result::Result<RestoreObjectResponse, Status> {
+            let mut objects = self.objects.write().unwrap();
+            let (object, _) = objects
+                .get_mut(&format!("{bucket}/{key}"))
+                .ok_or_else(|| Status::not_found("object missing"))?;
+            let status_code =
+                if object.restore_status == Some(common::RestoreStatus::RestoreCompleted as i32) {
+                    200
+                } else {
+                    202
+                };
+            object.restore_status = Some(common::RestoreStatus::RestoreCompleted as i32);
+            object.restore_expire_at = Some(Timestamp {
+                seconds: 999,
+                nanos: 0,
+            });
+            Ok(RestoreObjectResponse { status_code })
+        }
         async fn list_objects(
             &self,
             bucket: &str,
@@ -530,6 +674,42 @@ mod tests {
             Some(get_object_response::Payload::Data(bytes)) => assert_eq!(bytes, b"hello world"),
             _ => panic!("expected data"),
         }
+    }
+
+    #[tokio::test]
+    async fn delete_object_uses_backend() {
+        let svc = service();
+        svc.delete_object(Request::new(DeleteObjectRequest {
+            bucket: "docs".into(),
+            key: "readme.txt".into(),
+            version_id: None,
+        }))
+        .await
+        .unwrap();
+        assert!(svc
+            .head_object(Request::new(HeadObjectRequest {
+                bucket: "docs".into(),
+                key: "readme.txt".into(),
+                version_id: None
+            }))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_object_uses_backend() {
+        let response = service()
+            .restore_object(Request::new(RestoreObjectRequest {
+                bucket: "docs".into(),
+                key: "readme.txt".into(),
+                version_id: None,
+                days: 2,
+                tier: common::RestoreTier::Standard as i32,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.status_code, 200);
     }
 
     #[tokio::test]

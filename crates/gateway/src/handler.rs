@@ -1,8 +1,8 @@
 use crate::protocol::{format_restore_header, is_restore_request, S3ErrorCode, S3ErrorResponse};
 use crate::{DownloadedObject, GatewayState};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::{header::HeaderName, HeaderValue, StatusCode};
+use axum::http::{header::HeaderName, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::{routing::get, Router};
 use std::collections::HashMap;
@@ -26,10 +26,10 @@ fn build_router() -> Router<Arc<GatewayState>> {
         .route(
             "/:bucket/*key",
             get(get_object)
-                .put(put_object_placeholder)
-                .delete(delete_object_placeholder)
+                .put(put_object)
+                .delete(delete_object)
                 .head(head_object)
-                .post(post_object_placeholder),
+                .post(post_object),
         )
 }
 
@@ -111,12 +111,34 @@ async fn get_object(
     }
 }
 
-async fn put_object_placeholder(Path((bucket, key)): Path<(String, String)>) -> Response {
-    not_implemented_response("PutObject", &format!("/{bucket}/{key}"))
+async fn put_object(
+    State(state): State<Arc<GatewayState>>,
+    Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    match state
+        .backend
+        .put_object(&bucket, &key, body.to_vec(), content_type)
+        .await
+    {
+        Ok(response) => put_object_success_response(response),
+        Err(status) => grpc_status_to_s3_response(status, &format!("/{bucket}/{key}")),
+    }
 }
 
-async fn delete_object_placeholder(Path((bucket, key)): Path<(String, String)>) -> Response {
-    not_implemented_response("DeleteObject", &format!("/{bucket}/{key}"))
+async fn delete_object(
+    State(state): State<Arc<GatewayState>>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Response {
+    match state.backend.delete_object(&bucket, &key).await {
+        Ok(()) => empty_response(StatusCode::NO_CONTENT),
+        Err(status) => grpc_status_to_s3_response(status, &format!("/{bucket}/{key}")),
+    }
 }
 
 async fn head_object(
@@ -129,7 +151,8 @@ async fn head_object(
     }
 }
 
-async fn post_object_placeholder(
+async fn post_object(
+    State(state): State<Arc<GatewayState>>,
     Path((bucket, key)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
@@ -151,10 +174,31 @@ async fn post_object_placeholder(
         )
     };
     let resource = format!("/{bucket}/{key}");
-    if is_restore_request(raw_query.as_deref()) {
-        not_implemented_response("RestoreObject", &resource)
-    } else {
-        bad_request_response("UnsupportedPostAction", &resource)
+    if !is_restore_request(raw_query.as_deref()) {
+        return bad_request_response("UnsupportedPostAction", &resource);
+    }
+
+    let days = query
+        .get("days")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    let tier = match query.get("tier").map(String::as_str) {
+        Some("Expedited") => coldstore_proto::common::RestoreTier::Expedited,
+        Some("Bulk") => coldstore_proto::common::RestoreTier::Bulk,
+        _ => coldstore_proto::common::RestoreTier::Standard,
+    };
+
+    match state
+        .backend
+        .restore_object(&bucket, &key, days, tier)
+        .await
+    {
+        Ok(response) => empty_response(if response.status_code == 200 {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        }),
+        Err(status) => grpc_status_to_s3_response(status, &resource),
     }
 }
 
@@ -193,6 +237,17 @@ fn list_objects_xml_response(
         response.bucket, contents
     );
     xml_response(StatusCode::OK, body)
+}
+
+fn put_object_success_response(
+    response: coldstore_proto::scheduler::PutObjectResponse,
+) -> Response {
+    let mut http = empty_response(StatusCode::OK);
+    http.headers_mut().insert(
+        axum::http::header::ETAG,
+        HeaderValue::from_str(&response.etag).unwrap(),
+    );
+    http
 }
 
 fn get_object_success_response(object: DownloadedObject) -> Response {
@@ -243,18 +298,6 @@ fn normalize_restore_info(restore_info: &str) -> String {
     } else {
         format_restore_header(true, None)
     }
-}
-
-fn not_implemented_response(operation: &str, resource: &str) -> Response {
-    let message =
-        format!("{operation} route skeleton is present but backend integration is not implemented");
-    let body = S3ErrorResponse {
-        code: S3ErrorCode::NotImplemented,
-        message: &message,
-        resource,
-    }
-    .to_xml();
-    s3_xml_response(StatusCode::NOT_IMPLEMENTED, body)
 }
 
 fn bad_request_response(operation: &str, resource: &str) -> Response {
@@ -319,6 +362,7 @@ mod tests {
     use axum::http::Request;
     use coldstore_proto::scheduler::{
         BucketEntry, HeadObjectResponse, ListBucketsResponse, ListObjectsResponse, ObjectEntry,
+        PutObjectResponse, RestoreObjectResponse,
     };
     use tower::util::ServiceExt;
 
@@ -388,6 +432,42 @@ mod tests {
             })
         }
 
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _key: &str,
+            _body: Vec<u8>,
+            _content_type: Option<String>,
+        ) -> std::result::Result<PutObjectResponse, tonic::Status> {
+            Ok(PutObjectResponse {
+                etag: "etag-put".into(),
+                version_id: "v1".into(),
+            })
+        }
+
+        async fn get_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> std::result::Result<DownloadedObject, tonic::Status> {
+            Ok(DownloadedObject {
+                head: self.head_object(bucket, key).await?,
+                body: b"hello world".to_vec(),
+            })
+        }
+
+        async fn delete_object(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> std::result::Result<(), tonic::Status> {
+            if bucket == "docs" && key == "readme.txt" {
+                Ok(())
+            } else {
+                Err(tonic::Status::not_found("object missing"))
+            }
+        }
+
         async fn head_object(
             &self,
             bucket: &str,
@@ -407,15 +487,18 @@ mod tests {
             }
         }
 
-        async fn get_object(
+        async fn restore_object(
             &self,
             bucket: &str,
             key: &str,
-        ) -> std::result::Result<DownloadedObject, tonic::Status> {
-            Ok(DownloadedObject {
-                head: self.head_object(bucket, key).await?,
-                body: b"hello world".to_vec(),
-            })
+            _days: u32,
+            _tier: coldstore_proto::common::RestoreTier,
+        ) -> std::result::Result<RestoreObjectResponse, tonic::Status> {
+            if bucket == "docs" && key == "readme.txt" {
+                Ok(RestoreObjectResponse { status_code: 202 })
+            } else {
+                Err(tonic::Status::not_found("object missing"))
+            }
         }
     }
 
@@ -496,6 +579,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_object_route_uses_backend() {
+        let response = test_router(state())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/docs/readme.txt")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("hello world"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["etag"], "etag-put");
+    }
+
+    #[tokio::test]
     async fn get_object_route_returns_body_from_backend() {
         let response = test_router(state())
             .oneshot(
@@ -512,22 +612,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_post_route_returns_not_implemented_xml() {
+    async fn delete_object_route_uses_backend() {
         let response = test_router(state())
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/docs/readme.txt?restore=true")
+                    .method("DELETE")
+                    .uri("/docs/readme.txt")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8(body.to_vec())
-            .unwrap()
-            .contains("RestoreObject"));
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn restore_post_route_uses_backend() {
+        let response = test_router(state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/docs/readme.txt?restore=true&days=2&tier=Bulk")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
