@@ -3,6 +3,7 @@ use coldstore_proto::common;
 use coldstore_proto::scheduler::scheduler_service_server::SchedulerService;
 use coldstore_proto::scheduler::*;
 use prost_types::Timestamp;
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,65 +53,221 @@ pub trait Phase1SchedulerBackend: Send + Sync + 'static {
     ) -> std::result::Result<Vec<common::ObjectMetadata>, Status>;
 }
 
-struct RemoteSchedulerBackend;
+struct MetadataBackedSchedulerBackend {
+    metadata: coldstore_proto::metadata::metadata_service_client::MetadataServiceClient<
+        tonic::transport::Channel,
+    >,
+}
+
+impl MetadataBackedSchedulerBackend {
+    fn new(
+        metadata: coldstore_proto::metadata::metadata_service_client::MetadataServiceClient<
+            tonic::transport::Channel,
+        >,
+    ) -> Self {
+        Self { metadata }
+    }
+}
 
 #[tonic::async_trait]
-impl Phase1SchedulerBackend for RemoteSchedulerBackend {
+impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
     async fn list_buckets(&self) -> std::result::Result<Vec<common::BucketInfo>, Status> {
-        Err(phase1_unimplemented("scheduler.list_buckets"))
+        let mut client = self.metadata.clone();
+        Ok(client
+            .list_buckets(Request::new(()))
+            .await?
+            .into_inner()
+            .buckets)
     }
-    async fn create_bucket(&self, _bucket: &str) -> std::result::Result<(), Status> {
-        Err(phase1_unimplemented("scheduler.create_bucket"))
+
+    async fn create_bucket(&self, bucket: &str) -> std::result::Result<(), Status> {
+        let mut client = self.metadata.clone();
+        client
+            .create_bucket(Request::new(common::BucketInfo {
+                name: bucket.into(),
+                created_at: Some(now_timestamp()),
+                owner: None,
+                versioning_enabled: false,
+                object_count: 0,
+                total_size: 0,
+            }))
+            .await?;
+        Ok(())
     }
-    async fn delete_bucket(&self, _bucket: &str) -> std::result::Result<(), Status> {
-        Err(phase1_unimplemented("scheduler.delete_bucket"))
+
+    async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), Status> {
+        let mut client = self.metadata.clone();
+        client
+            .delete_bucket(Request::new(
+                coldstore_proto::metadata::DeleteBucketRequest {
+                    name: bucket.into(),
+                },
+            ))
+            .await?;
+        Ok(())
     }
-    async fn head_bucket(&self, _bucket: &str) -> std::result::Result<(), Status> {
-        Err(phase1_unimplemented("scheduler.head_bucket"))
+
+    async fn head_bucket(&self, bucket: &str) -> std::result::Result<(), Status> {
+        let mut client = self.metadata.clone();
+        client
+            .get_bucket(Request::new(coldstore_proto::metadata::GetBucketRequest {
+                name: bucket.into(),
+            }))
+            .await?;
+        Ok(())
     }
+
     async fn head_object(
         &self,
-        _bucket: &str,
-        _key: &str,
+        bucket: &str,
+        key: &str,
     ) -> std::result::Result<common::ObjectMetadata, Status> {
-        Err(phase1_unimplemented("scheduler.head_object"))
+        let mut client = self.metadata.clone();
+        Ok(client
+            .head_object(Request::new(coldstore_proto::metadata::HeadObjectRequest {
+                bucket: bucket.into(),
+                key: key.into(),
+            }))
+            .await?
+            .into_inner())
     }
+
     async fn get_object(
         &self,
-        _bucket: &str,
-        _key: &str,
+        bucket: &str,
+        key: &str,
     ) -> std::result::Result<(common::ObjectMetadata, Vec<u8>), Status> {
-        Err(phase1_unimplemented("scheduler.get_object"))
+        let object = self.head_object(bucket, key).await?;
+        Err(Status::failed_precondition(format!(
+            "scheduler.get_object requires phase-1 cache wiring; metadata is available for {}/{} but body retrieval is not yet connected",
+            object.bucket, object.key
+        )))
     }
+
     async fn put_object(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _body: Vec<u8>,
-        _content_type: Option<String>,
+        bucket: &str,
+        key: &str,
+        body: Vec<u8>,
+        content_type: Option<String>,
     ) -> std::result::Result<PutObjectResponse, Status> {
-        Err(phase1_unimplemented("scheduler.put_object"))
+        let checksum = sha256_hex(&body);
+        let now = now_timestamp();
+        let object = common::ObjectMetadata {
+            bucket: bucket.into(),
+            key: key.into(),
+            version_id: None,
+            size: body.len() as u64,
+            checksum: checksum.clone(),
+            content_type,
+            etag: Some(checksum.clone()),
+            storage_class: common::StorageClass::ColdPending as i32,
+            archive_id: None,
+            tape_id: None,
+            tape_set: vec![],
+            tape_block_offset: None,
+            restore_status: None,
+            restore_expire_at: None,
+            created_at: Some(now),
+            updated_at: Some(now),
+        };
+        let mut client = self.metadata.clone();
+        client.put_object(Request::new(object)).await?;
+        Ok(PutObjectResponse {
+            etag: checksum,
+            version_id: String::new(),
+        })
     }
-    async fn delete_object(&self, _bucket: &str, _key: &str) -> std::result::Result<(), Status> {
-        Err(phase1_unimplemented("scheduler.delete_object"))
+
+    async fn delete_object(&self, bucket: &str, key: &str) -> std::result::Result<(), Status> {
+        let mut client = self.metadata.clone();
+        client
+            .delete_object(Request::new(
+                coldstore_proto::metadata::DeleteObjectRequest {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                },
+            ))
+            .await?;
+        Ok(())
     }
+
     async fn restore_object(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _days: u32,
+        bucket: &str,
+        key: &str,
+        days: u32,
         _tier: common::RestoreTier,
     ) -> std::result::Result<RestoreObjectResponse, Status> {
-        Err(phase1_unimplemented("scheduler.restore_object"))
+        let mut client = self.metadata.clone();
+        let object = client
+            .get_object(Request::new(coldstore_proto::metadata::GetObjectRequest {
+                bucket: bucket.into(),
+                key: key.into(),
+            }))
+            .await?
+            .into_inner();
+
+        if object.storage_class != common::StorageClass::Cold as i32 {
+            return Err(Status::failed_precondition(
+                "restore_object requires an archived COLD object in phase-1 metadata-backed mode",
+            ));
+        }
+
+        let restore_status = object
+            .restore_status
+            .and_then(|status| common::RestoreStatus::try_from(status).ok());
+
+        match restore_status {
+            Some(common::RestoreStatus::RestoreCompleted) => {
+                Ok(RestoreObjectResponse { status_code: 200 })
+            }
+            Some(
+                common::RestoreStatus::RestorePending
+                | common::RestoreStatus::RestoreWaitingForMedia
+                | common::RestoreStatus::RestoreInProgress,
+            ) => Ok(RestoreObjectResponse { status_code: 202 }),
+            Some(common::RestoreStatus::RestoreExpired | common::RestoreStatus::RestoreFailed) => {
+                Err(Status::failed_precondition(
+                    "restore_object cannot reopen expired or failed restores in phase-1 metadata-backed mode",
+                ))
+            }
+            Some(common::RestoreStatus::Unspecified) | None => {
+                client
+                    .update_restore_status(Request::new(
+                        coldstore_proto::metadata::UpdateRestoreStatusRequest {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                            status: common::RestoreStatus::RestorePending as i32,
+                            expire_at: Some(days_from_now(days.max(1))),
+                        },
+                    ))
+                    .await?;
+                Ok(RestoreObjectResponse { status_code: 202 })
+            }
+        }
     }
+
     async fn list_objects(
         &self,
-        _bucket: &str,
-        _prefix: Option<&str>,
-        _marker: Option<&str>,
-        _max_keys: u32,
+        bucket: &str,
+        prefix: Option<&str>,
+        marker: Option<&str>,
+        max_keys: u32,
     ) -> std::result::Result<Vec<common::ObjectMetadata>, Status> {
-        Err(phase1_unimplemented("scheduler.list_objects"))
+        let mut client = self.metadata.clone();
+        Ok(client
+            .list_objects(Request::new(
+                coldstore_proto::metadata::ListObjectsRequest {
+                    bucket: bucket.into(),
+                    prefix: prefix.map(str::to_owned),
+                    marker: marker.map(str::to_owned),
+                    max_keys,
+                },
+            ))
+            .await?
+            .into_inner()
+            .objects)
     }
 }
 
@@ -121,9 +278,10 @@ pub struct SchedulerServiceImpl {
 
 impl SchedulerServiceImpl {
     pub fn new(state: Arc<SchedulerState>) -> Self {
+        let backend = Arc::new(MetadataBackedSchedulerBackend::new(state.metadata.clone()));
         Self {
             _state: state,
-            backend: Arc::new(RemoteSchedulerBackend),
+            backend,
         }
     }
 
@@ -138,10 +296,35 @@ impl SchedulerServiceImpl {
     }
 }
 
+#[cfg(test)]
 fn phase1_unimplemented(op: &str) -> Status {
     Status::unimplemented(format!(
         "{op} is not implemented in phase-1 safe mode; use unit-tested metadata/cache services only"
     ))
+}
+
+fn sha256_hex(body: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    format!("{:x}", hasher.finalize())
+}
+
+fn now_timestamp() -> Timestamp {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Timestamp {
+        seconds: now.as_secs() as i64,
+        nanos: now.subsec_nanos() as i32,
+    }
+}
+
+fn days_from_now(days: u32) -> Timestamp {
+    let now = chrono::Utc::now() + chrono::Duration::days(days as i64);
+    Timestamp {
+        seconds: now.timestamp(),
+        nanos: now.timestamp_subsec_nanos() as i32,
+    }
 }
 
 fn build_restore_info(
@@ -396,8 +579,13 @@ impl SchedulerService for SchedulerServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coldstore_common::config::SchedulerConfig;
+    use coldstore_common::config::{MetadataConfig, SchedulerConfig};
+    use coldstore_metadata::service::MetadataServiceImpl;
+    use coldstore_proto::metadata::metadata_service_server::MetadataServiceServer;
+    use tokio::sync::oneshot;
+    use tokio::time::{sleep, Duration};
     use tokio_stream::StreamExt;
+    use tonic::transport::Server;
 
     #[derive(Default)]
     struct InMemoryBackend {
@@ -796,6 +984,238 @@ mod tests {
         assert_eq!(response.contents.len(), 1);
         assert_eq!(response.contents[0].key, "readme.txt");
         assert_eq!(response.contents[0].storage_class, "COLD");
+    }
+
+    async fn metadata_backed_service() -> (
+        SchedulerServiceImpl,
+        Arc<SchedulerState>,
+        oneshot::Sender<()>,
+    ) {
+        let metadata = MetadataServiceImpl::new(&MetadataConfig::default())
+            .await
+            .expect("metadata service init");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(MetadataServiceServer::new(metadata))
+                .serve_with_shutdown(addr, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("metadata server should run");
+        });
+
+        let mut metadata_client = None;
+        for _ in 0..20 {
+            match coldstore_proto::metadata::metadata_service_client::MetadataServiceClient::connect(
+                format!("http://{addr}"),
+            )
+            .await
+            {
+                Ok(client) => {
+                    metadata_client = Some(client);
+                    break;
+                }
+                Err(_) => sleep(Duration::from_millis(25)).await,
+            }
+        }
+        let metadata = metadata_client.expect("connect metadata client");
+        let state = Arc::new(SchedulerState {
+            metadata,
+            cache: None,
+            tape: None,
+            config: SchedulerConfig::default(),
+        });
+        (SchedulerServiceImpl::new(state.clone()), state, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn default_service_uses_metadata_for_bucket_ops() {
+        let (svc, _state, shutdown_tx) = metadata_backed_service().await;
+
+        svc.create_bucket(Request::new(CreateBucketRequest {
+            bucket: "phase1-bucket".into(),
+        }))
+        .await
+        .expect("create bucket through metadata-backed scheduler");
+
+        let buckets = svc
+            .list_buckets(Request::new(()))
+            .await
+            .expect("list buckets through metadata-backed scheduler")
+            .into_inner();
+        assert!(buckets
+            .buckets
+            .iter()
+            .any(|bucket| bucket.name == "phase1-bucket"));
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn default_service_uses_metadata_for_object_metadata_ops() {
+        let (svc, state, shutdown_tx) = metadata_backed_service().await;
+
+        svc.create_bucket(Request::new(CreateBucketRequest {
+            bucket: "docs".into(),
+        }))
+        .await
+        .expect("create bucket");
+
+        let mut metadata = state.metadata.clone();
+        metadata
+            .put_object(Request::new(common::ObjectMetadata {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+                version_id: None,
+                size: 5,
+                checksum: "seed-checksum".into(),
+                content_type: Some("text/plain".into()),
+                etag: Some("seed-etag".into()),
+                storage_class: common::StorageClass::ColdPending as i32,
+                archive_id: None,
+                tape_id: None,
+                tape_set: vec![],
+                tape_block_offset: None,
+                restore_status: None,
+                restore_expire_at: None,
+                created_at: Some(Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                updated_at: Some(Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+            }))
+            .await
+            .expect("seed object in metadata");
+
+        let head = svc
+            .head_object(Request::new(HeadObjectRequest {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+                version_id: None,
+            }))
+            .await
+            .expect("head object")
+            .into_inner();
+        assert_eq!(head.content_length, 5);
+        assert_eq!(head.storage_class, common::StorageClass::ColdPending as i32);
+
+        let list = svc
+            .list_objects(Request::new(ListObjectsRequest {
+                bucket: "docs".into(),
+                prefix: Some("gui".into()),
+                marker: None,
+                delimiter: None,
+                max_keys: 10,
+            }))
+            .await
+            .expect("list objects")
+            .into_inner();
+        assert_eq!(list.contents.len(), 1);
+        assert_eq!(list.contents[0].key, "guide.txt");
+
+        let mut metadata = state.metadata.clone();
+        metadata
+            .update_storage_class(Request::new(
+                coldstore_proto::metadata::UpdateStorageClassRequest {
+                    bucket: "docs".into(),
+                    key: "guide.txt".into(),
+                    storage_class: common::StorageClass::Cold as i32,
+                },
+            ))
+            .await
+            .expect("mark object as cold");
+
+        let restore = svc
+            .restore_object(Request::new(RestoreObjectRequest {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+                version_id: None,
+                days: 3,
+                tier: common::RestoreTier::Standard as i32,
+            }))
+            .await
+            .expect("restore object")
+            .into_inner();
+        assert_eq!(restore.status_code, 202);
+
+        let restored = svc
+            .head_object(Request::new(HeadObjectRequest {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+                version_id: None,
+            }))
+            .await
+            .expect("head restored object")
+            .into_inner();
+        assert_eq!(
+            restored.restore_info.as_deref(),
+            Some("ongoing-request=\"true\"")
+        );
+
+        svc.delete_object(Request::new(DeleteObjectRequest {
+            bucket: "docs".into(),
+            key: "guide.txt".into(),
+            version_id: None,
+        }))
+        .await
+        .expect("delete object through metadata-backed scheduler");
+
+        assert!(svc
+            .head_object(Request::new(HeadObjectRequest {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+                version_id: None,
+            }))
+            .await
+            .is_err());
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn default_metadata_backend_puts_object_and_reports_cache_gap() {
+        let (_svc, state, shutdown_tx) = metadata_backed_service().await;
+        let backend = MetadataBackedSchedulerBackend::new(state.metadata.clone());
+
+        backend
+            .create_bucket("docs")
+            .await
+            .expect("create bucket through metadata backend");
+
+        let put = backend
+            .put_object(
+                "docs",
+                "guide.txt",
+                b"hello".to_vec(),
+                Some("text/plain".into()),
+            )
+            .await
+            .expect("put object through metadata backend");
+        assert!(!put.etag.is_empty());
+
+        let listed = backend
+            .list_objects("docs", Some("gui"), None, 10)
+            .await
+            .expect("list objects through metadata backend");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].etag.as_deref(), Some(put.etag.as_str()));
+
+        let err = backend
+            .get_object("docs", "guide.txt")
+            .await
+            .expect_err("get_object should explain that cache is still not wired");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("cache wiring"));
+
+        shutdown_tx.send(()).ok();
     }
 
     #[test]
