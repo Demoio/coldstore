@@ -5,7 +5,8 @@ use anyhow::Result;
 use coldstore_common::config::GatewayConfig;
 use coldstore_proto::scheduler::scheduler_service_client::SchedulerServiceClient;
 use coldstore_proto::scheduler::{
-    HeadBucketRequest, HeadObjectRequest, HeadObjectResponse, ListBucketsResponse,
+    CreateBucketRequest, DeleteBucketRequest, HeadBucketRequest, HeadObjectRequest,
+    HeadObjectResponse, ListBucketsResponse, ListObjectsRequest, ListObjectsResponse,
 };
 use std::sync::Arc;
 use tonic::transport::Channel;
@@ -14,7 +15,17 @@ use tracing::info;
 #[tonic::async_trait]
 pub trait GatewayBackend: Send + Sync + 'static {
     async fn list_buckets(&self) -> std::result::Result<ListBucketsResponse, tonic::Status>;
+    async fn create_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status>;
+    async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status>;
     async fn head_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status>;
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        marker: Option<&str>,
+        delimiter: Option<&str>,
+        max_keys: u32,
+    ) -> std::result::Result<ListObjectsResponse, tonic::Status>;
     async fn head_object(
         &self,
         bucket: &str,
@@ -45,6 +56,26 @@ impl GatewayBackend for GrpcGatewayBackend {
         client.list_buckets(()).await.map(|r| r.into_inner())
     }
 
+    async fn create_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status> {
+        let mut client = self.connect().await?;
+        client
+            .create_bucket(CreateBucketRequest {
+                bucket: bucket.to_string(),
+            })
+            .await
+            .map(|_| ())
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status> {
+        let mut client = self.connect().await?;
+        client
+            .delete_bucket(DeleteBucketRequest {
+                bucket: bucket.to_string(),
+            })
+            .await
+            .map(|_| ())
+    }
+
     async fn head_bucket(&self, bucket: &str) -> std::result::Result<(), tonic::Status> {
         let mut client = self.connect().await?;
         client
@@ -53,6 +84,27 @@ impl GatewayBackend for GrpcGatewayBackend {
             })
             .await
             .map(|_| ())
+    }
+
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        marker: Option<&str>,
+        delimiter: Option<&str>,
+        max_keys: u32,
+    ) -> std::result::Result<ListObjectsResponse, tonic::Status> {
+        let mut client = self.connect().await?;
+        client
+            .list_objects(ListObjectsRequest {
+                bucket: bucket.to_string(),
+                prefix: prefix.map(str::to_string),
+                marker: marker.map(str::to_string),
+                delimiter: delimiter.map(str::to_string),
+                max_keys,
+            })
+            .await
+            .map(|r| r.into_inner())
     }
 
     async fn head_object(

@@ -13,6 +13,8 @@ use tonic::{Request, Response, Status, Streaming};
 #[tonic::async_trait]
 pub trait Phase1SchedulerBackend: Send + Sync + 'static {
     async fn list_buckets(&self) -> std::result::Result<Vec<common::BucketInfo>, Status>;
+    async fn create_bucket(&self, bucket: &str) -> std::result::Result<(), Status>;
+    async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), Status>;
     async fn head_bucket(&self, bucket: &str) -> std::result::Result<(), Status>;
     async fn head_object(
         &self,
@@ -34,6 +36,14 @@ struct RemoteSchedulerBackend;
 impl Phase1SchedulerBackend for RemoteSchedulerBackend {
     async fn list_buckets(&self) -> std::result::Result<Vec<common::BucketInfo>, Status> {
         Err(phase1_unimplemented("scheduler.list_buckets"))
+    }
+
+    async fn create_bucket(&self, _bucket: &str) -> std::result::Result<(), Status> {
+        Err(phase1_unimplemented("scheduler.create_bucket"))
+    }
+
+    async fn delete_bucket(&self, _bucket: &str) -> std::result::Result<(), Status> {
+        Err(phase1_unimplemented("scheduler.delete_bucket"))
     }
 
     async fn head_bucket(&self, _bucket: &str) -> std::result::Result<(), Status> {
@@ -243,16 +253,20 @@ impl SchedulerService for SchedulerServiceImpl {
 
     async fn create_bucket(
         &self,
-        _request: Request<CreateBucketRequest>,
+        request: Request<CreateBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        Err(phase1_unimplemented("scheduler.create_bucket"))
+        let request = request.into_inner();
+        self.backend.create_bucket(&request.bucket).await?;
+        Ok(Response::new(()))
     }
 
     async fn delete_bucket(
         &self,
-        _request: Request<DeleteBucketRequest>,
+        request: Request<DeleteBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        Err(phase1_unimplemented("scheduler.delete_bucket"))
+        let request = request.into_inner();
+        self.backend.delete_bucket(&request.bucket).await?;
+        Ok(Response::new(()))
     }
 
     async fn head_bucket(
@@ -339,6 +353,33 @@ mod tests {
     impl Phase1SchedulerBackend for InMemoryBackend {
         async fn list_buckets(&self) -> std::result::Result<Vec<common::BucketInfo>, Status> {
             Ok(self.buckets.read().unwrap().clone())
+        }
+
+        async fn create_bucket(&self, bucket: &str) -> std::result::Result<(), Status> {
+            let mut buckets = self.buckets.write().unwrap();
+            if buckets.iter().any(|b| b.name == bucket) {
+                return Err(Status::already_exists("bucket exists"));
+            }
+            buckets.push(common::BucketInfo {
+                name: bucket.into(),
+                created_at: None,
+                owner: None,
+                versioning_enabled: false,
+                object_count: 0,
+                total_size: 0,
+            });
+            Ok(())
+        }
+
+        async fn delete_bucket(&self, bucket: &str) -> std::result::Result<(), Status> {
+            let mut buckets = self.buckets.write().unwrap();
+            let before = buckets.len();
+            buckets.retain(|b| b.name != bucket);
+            if buckets.len() == before {
+                Err(Status::not_found("bucket missing"))
+            } else {
+                Ok(())
+            }
         }
 
         async fn head_bucket(&self, bucket: &str) -> std::result::Result<(), Status> {
@@ -432,6 +473,38 @@ mod tests {
             .into_inner();
         assert_eq!(response.buckets.len(), 1);
         assert_eq!(response.buckets[0].name, "docs");
+    }
+
+    #[tokio::test]
+    async fn create_bucket_uses_backend() {
+        let svc = service();
+        svc.create_bucket(Request::new(CreateBucketRequest {
+            bucket: "new-bucket".into(),
+        }))
+        .await
+        .unwrap();
+        let response = svc
+            .list_buckets(Request::new(()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.buckets.iter().any(|b| b.name == "new-bucket"));
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_uses_backend() {
+        let svc = service();
+        svc.delete_bucket(Request::new(DeleteBucketRequest {
+            bucket: "docs".into(),
+        }))
+        .await
+        .unwrap();
+        let response = svc
+            .list_buckets(Request::new(()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.buckets.iter().any(|b| b.name == "docs"));
     }
 
     #[tokio::test]
