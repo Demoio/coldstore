@@ -63,6 +63,7 @@ impl Default for MetadataConfig {
 pub struct SchedulerConfig {
     pub listen: String,
     pub metadata_addrs: Vec<String>,
+    pub cache_addrs: Vec<String>,
     pub archive: ArchiveSchedulerConfig,
     pub recall: RecallSchedulerConfig,
 }
@@ -96,6 +97,7 @@ impl Default for SchedulerConfig {
                 "127.0.0.1:21002".to_string(),
                 "127.0.0.1:21003".to_string(),
             ],
+            cache_addrs: vec!["127.0.0.1:23001".to_string()],
             archive: ArchiveSchedulerConfig {
                 scan_interval_secs: 60,
                 batch_size: 1000,

@@ -21,9 +21,15 @@ pub async fn run(config: SchedulerConfig) -> Result<()> {
     let metadata_addr = format!("http://{}", &config.metadata_addrs[0]);
     let metadata = MetadataServiceClient::connect(metadata_addr).await?;
 
+    let cache = if let Some(addr) = config.cache_addrs.first() {
+        Some(CacheServiceClient::connect(format!("http://{addr}")).await?)
+    } else {
+        None
+    };
+
     let state = std::sync::Arc::new(SchedulerState {
         metadata,
-        cache: None,
+        cache,
         tape: None,
         config: config.clone(),
     });

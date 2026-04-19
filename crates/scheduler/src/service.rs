@@ -1,4 +1,10 @@
 use crate::SchedulerState;
+use coldstore_proto::cache::cache_service_client::CacheServiceClient;
+use coldstore_proto::cache::{
+    self, put_restored_request, put_staging_request, ContainsRequest, DeleteRequest,
+    DeleteStagingRequest, GetRequest as CacheGetRequest, GetStagingRequest, PutRestoredMeta,
+    PutRestoredRequest, PutStagingMeta, PutStagingRequest,
+};
 use coldstore_proto::common;
 use coldstore_proto::scheduler::scheduler_service_server::SchedulerService;
 use coldstore_proto::scheduler::*;
@@ -44,6 +50,7 @@ pub trait Phase1SchedulerBackend: Send + Sync + 'static {
         days: u32,
         tier: common::RestoreTier,
     ) -> std::result::Result<RestoreObjectResponse, Status>;
+    async fn archive_staging_batch(&self, limit: u32) -> std::result::Result<Vec<String>, Status>;
     async fn list_objects(
         &self,
         bucket: &str,
@@ -57,6 +64,7 @@ struct MetadataBackedSchedulerBackend {
     metadata: coldstore_proto::metadata::metadata_service_client::MetadataServiceClient<
         tonic::transport::Channel,
     >,
+    cache: Option<CacheServiceClient<tonic::transport::Channel>>,
 }
 
 impl MetadataBackedSchedulerBackend {
@@ -64,8 +72,67 @@ impl MetadataBackedSchedulerBackend {
         metadata: coldstore_proto::metadata::metadata_service_client::MetadataServiceClient<
             tonic::transport::Channel,
         >,
+        cache: Option<CacheServiceClient<tonic::transport::Channel>>,
     ) -> Self {
-        Self { metadata }
+        Self { metadata, cache }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn cache_client(
+        &self,
+    ) -> std::result::Result<CacheServiceClient<tonic::transport::Channel>, Status> {
+        self.cache.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "scheduler cache client is not configured; restore/get body paths require cache wiring",
+            )
+        })
+    }
+
+    async fn archive_staging_batch(&self, limit: u32) -> std::result::Result<Vec<String>, Status> {
+        let mut cache = self.cache_client()?;
+        let staging = cache
+            .list_staging_keys(Request::new(cache::ListStagingKeysRequest {
+                limit,
+                after: None,
+            }))
+            .await?
+            .into_inner();
+
+        let mut metadata = self.metadata.clone();
+        let mut archived = Vec::new();
+        for entry in staging.entries {
+            let archive_id = phase1_archive_id(&entry.bucket, &entry.key);
+            metadata
+                .update_archive_location(Request::new(
+                    coldstore_proto::metadata::UpdateArchiveLocationRequest {
+                        bucket: entry.bucket.clone(),
+                        key: entry.key.clone(),
+                        archive_id,
+                        tape_id: phase1_archive_tape_id().to_string(),
+                        tape_set: vec![phase1_archive_tape_id().to_string()],
+                        tape_block_offset: 0,
+                    },
+                ))
+                .await?;
+            metadata
+                .update_storage_class(Request::new(
+                    coldstore_proto::metadata::UpdateStorageClassRequest {
+                        bucket: entry.bucket.clone(),
+                        key: entry.key.clone(),
+                        storage_class: common::StorageClass::Cold as i32,
+                    },
+                ))
+                .await?;
+            cache
+                .delete_staging(Request::new(DeleteStagingRequest {
+                    bucket: entry.bucket.clone(),
+                    key: entry.key.clone(),
+                    version_id: entry.version_id.clone(),
+                }))
+                .await?;
+            archived.push(format!("{}/{}", entry.bucket, entry.key));
+        }
+        Ok(archived)
     }
 }
 
@@ -138,10 +205,45 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
         key: &str,
     ) -> std::result::Result<(common::ObjectMetadata, Vec<u8>), Status> {
         let object = self.head_object(bucket, key).await?;
-        Err(Status::failed_precondition(format!(
-            "scheduler.get_object requires phase-1 cache wiring; metadata is available for {}/{} but body retrieval is not yet connected",
-            object.bucket, object.key
-        )))
+        let mut cache = self.cache_client()?;
+        let mut stream = cache
+            .get(Request::new(CacheGetRequest {
+                bucket: bucket.into(),
+                key: key.into(),
+                version_id: None,
+            }))
+            .await
+            .map_err(|status| {
+                if status.code() == tonic::Code::NotFound {
+                    Status::failed_precondition(format!(
+                        "object {bucket}/{key} is not currently restored in cache"
+                    ))
+                } else {
+                    status
+                }
+            })?
+            .into_inner();
+
+        let first = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::internal("missing restored cache metadata chunk"))?;
+        match first.payload {
+            Some(cache::get_response::Payload::Meta(_)) => {}
+            _ => {
+                return Err(Status::internal(
+                    "first restored cache chunk was not metadata",
+                ))
+            }
+        }
+
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            if let Some(cache::get_response::Payload::Data(bytes)) = chunk.payload {
+                body.extend_from_slice(&bytes);
+            }
+        }
+        Ok((object, body))
     }
 
     async fn put_object(
@@ -159,7 +261,7 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
             version_id: None,
             size: body.len() as u64,
             checksum: checksum.clone(),
-            content_type,
+            content_type: content_type.clone(),
             etag: Some(checksum.clone()),
             storage_class: common::StorageClass::ColdPending as i32,
             archive_id: None,
@@ -173,6 +275,28 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
         };
         let mut client = self.metadata.clone();
         client.put_object(Request::new(object)).await?;
+
+        if let Some(mut cache) = self.cache.clone() {
+            cache
+                .put_staging(Request::new(tokio_stream::iter(vec![
+                    PutStagingRequest {
+                        payload: Some(put_staging_request::Payload::Meta(PutStagingMeta {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                            version_id: None,
+                            size: body.len() as u64,
+                            checksum: Some(checksum.clone()),
+                            content_type,
+                            etag: Some(checksum.clone()),
+                        })),
+                    },
+                    PutStagingRequest {
+                        payload: Some(put_staging_request::Payload::Data(body)),
+                    },
+                ])))
+                .await?;
+        }
+
         Ok(PutObjectResponse {
             etag: checksum,
             version_id: String::new(),
@@ -189,6 +313,23 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
                 },
             ))
             .await?;
+
+        if let Some(mut cache) = self.cache.clone() {
+            let _ = cache
+                .delete(Request::new(DeleteRequest {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    version_id: None,
+                }))
+                .await;
+            let _ = cache
+                .delete_staging(Request::new(DeleteStagingRequest {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    version_id: None,
+                }))
+                .await;
+        }
         Ok(())
     }
 
@@ -214,14 +355,30 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
             ));
         }
 
+        let expire_at = days_from_now(days.max(1));
+        let mut cache = self.cache_client()?;
+        let contains = cache
+            .contains(Request::new(ContainsRequest {
+                bucket: bucket.into(),
+                key: key.into(),
+                version_id: None,
+            }))
+            .await?
+            .into_inner();
+
         let restore_status = object
             .restore_status
             .and_then(|status| common::RestoreStatus::try_from(status).ok());
 
+        if matches!(
+            restore_status,
+            Some(common::RestoreStatus::RestoreCompleted)
+        ) && contains.exists
+        {
+            return Ok(RestoreObjectResponse { status_code: 200 });
+        }
+
         match restore_status {
-            Some(common::RestoreStatus::RestoreCompleted) => {
-                Ok(RestoreObjectResponse { status_code: 200 })
-            }
             Some(
                 common::RestoreStatus::RestorePending
                 | common::RestoreStatus::RestoreWaitingForMedia
@@ -232,20 +389,98 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
                     "restore_object cannot reopen expired or failed restores in phase-1 metadata-backed mode",
                 ))
             }
-            Some(common::RestoreStatus::Unspecified) | None => {
+            Some(common::RestoreStatus::RestoreCompleted)
+            | Some(common::RestoreStatus::Unspecified)
+            | None => {
+                let mut staging = cache
+                    .get_staging(Request::new(GetStagingRequest {
+                        bucket: bucket.into(),
+                        key: key.into(),
+                        version_id: None,
+                    }))
+                    .await
+                    .map_err(|status| {
+                        if status.code() == tonic::Code::NotFound {
+                            Status::failed_precondition(format!(
+                                "restore_object requires staged bytes for {bucket}/{key} in phase-1 mode"
+                            ))
+                        } else {
+                            status
+                        }
+                    })?
+                    .into_inner();
+
+                let first = staging
+                    .message()
+                    .await?
+                    .ok_or_else(|| Status::internal("missing staging metadata chunk"))?;
+                let staging_meta = match first.payload {
+                    Some(cache::get_staging_response::Payload::Meta(meta)) => meta,
+                    _ => return Err(Status::internal("first staging chunk was not metadata")),
+                };
+                let mut body = Vec::new();
+                while let Some(chunk) = staging.message().await? {
+                    if let Some(cache::get_staging_response::Payload::Data(bytes)) = chunk.payload {
+                        body.extend_from_slice(&bytes);
+                    }
+                }
+
                 client
                     .update_restore_status(Request::new(
                         coldstore_proto::metadata::UpdateRestoreStatusRequest {
                             bucket: bucket.into(),
                             key: key.into(),
                             status: common::RestoreStatus::RestorePending as i32,
-                            expire_at: Some(days_from_now(days.max(1))),
+                            expire_at: Some(expire_at),
+                        },
+                    ))
+                    .await?;
+                client
+                    .update_restore_status(Request::new(
+                        coldstore_proto::metadata::UpdateRestoreStatusRequest {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                            status: common::RestoreStatus::RestoreInProgress as i32,
+                            expire_at: Some(expire_at),
+                        },
+                    ))
+                    .await?;
+                cache
+                    .put_restored(Request::new(tokio_stream::iter(vec![
+                        PutRestoredRequest {
+                            payload: Some(put_restored_request::Payload::Meta(PutRestoredMeta {
+                                bucket: bucket.into(),
+                                key: key.into(),
+                                version_id: staging_meta.version_id,
+                                size: staging_meta.size,
+                                checksum: staging_meta.checksum,
+                                content_type: staging_meta.content_type,
+                                etag: staging_meta.etag,
+                                expire_at: Some(expire_at),
+                            })),
+                        },
+                        PutRestoredRequest {
+                            payload: Some(put_restored_request::Payload::Data(body)),
+                        },
+                    ])))
+                    .await?;
+                client
+                    .update_restore_status(Request::new(
+                        coldstore_proto::metadata::UpdateRestoreStatusRequest {
+                            bucket: bucket.into(),
+                            key: key.into(),
+                            status: common::RestoreStatus::RestoreCompleted as i32,
+                            expire_at: Some(expire_at),
                         },
                     ))
                     .await?;
                 Ok(RestoreObjectResponse { status_code: 202 })
             }
         }
+    }
+
+    async fn archive_staging_batch(&self, limit: u32) -> std::result::Result<Vec<String>, Status> {
+        MetadataBackedSchedulerBackend::archive_staging_batch(self, limit).await
     }
 
     async fn list_objects(
@@ -278,11 +513,21 @@ pub struct SchedulerServiceImpl {
 
 impl SchedulerServiceImpl {
     pub fn new(state: Arc<SchedulerState>) -> Self {
-        let backend = Arc::new(MetadataBackedSchedulerBackend::new(state.metadata.clone()));
+        let backend = Arc::new(MetadataBackedSchedulerBackend::new(
+            state.metadata.clone(),
+            state.cache.clone(),
+        ));
         Self {
             _state: state,
             backend,
         }
+    }
+
+    pub async fn archive_staging_batch(
+        &self,
+        limit: u32,
+    ) -> std::result::Result<Vec<String>, Status> {
+        self.backend.archive_staging_batch(limit).await
     }
 
     pub fn new_with_backend(
@@ -396,6 +641,14 @@ fn storage_class_label(storage_class: i32) -> &'static str {
         Some(common::StorageClass::Cold) => "COLD",
         _ => "UNKNOWN",
     }
+}
+
+fn phase1_archive_tape_id() -> &'static str {
+    "phase1-cache-archive"
+}
+
+fn phase1_archive_id(bucket: &str, key: &str) -> String {
+    format!("phase1-archive:{bucket}/{key}")
 }
 
 #[tonic::async_trait]
@@ -579,8 +832,17 @@ impl SchedulerService for SchedulerServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coldstore_common::config::{MetadataConfig, SchedulerConfig};
+    use coldstore_cache::service::CacheServiceImpl;
+    use coldstore_common::config::{
+        CacheBackendConfig, CacheConfig, MetadataConfig, SchedulerConfig,
+    };
     use coldstore_metadata::service::MetadataServiceImpl;
+    use coldstore_proto::cache::cache_service_server::CacheServiceServer;
+    use coldstore_proto::cache::{
+        cache_service_client::CacheServiceClient, put_restored_request, put_staging_request,
+        ContainsRequest, GetRequest as CacheGetRequest, PutRestoredMeta, PutRestoredRequest,
+        PutStagingMeta, PutStagingRequest,
+    };
     use coldstore_proto::metadata::metadata_service_server::MetadataServiceServer;
     use tokio::sync::oneshot;
     use tokio::time::{sleep, Duration};
@@ -786,6 +1048,12 @@ mod tests {
             });
             Ok(RestoreObjectResponse { status_code })
         }
+        async fn archive_staging_batch(
+            &self,
+            _limit: u32,
+        ) -> std::result::Result<Vec<String>, Status> {
+            Ok(vec![])
+        }
         async fn list_objects(
             &self,
             bucket: &str,
@@ -986,6 +1254,20 @@ mod tests {
         assert_eq!(response.contents[0].storage_class, "COLD");
     }
 
+    async fn connect_with_retry<T, F, Fut>(mut connector: F) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, tonic::transport::Error>>,
+    {
+        for _ in 0..20 {
+            match connector().await {
+                Ok(client) => return client,
+                Err(_) => sleep(Duration::from_millis(25)).await,
+            }
+        }
+        panic!("failed to connect test client after retries");
+    }
+
     async fn metadata_backed_service() -> (
         SchedulerServiceImpl,
         Arc<SchedulerState>,
@@ -1009,21 +1291,12 @@ mod tests {
                 .expect("metadata server should run");
         });
 
-        let mut metadata_client = None;
-        for _ in 0..20 {
-            match coldstore_proto::metadata::metadata_service_client::MetadataServiceClient::connect(
+        let metadata = connect_with_retry(|| {
+            coldstore_proto::metadata::metadata_service_client::MetadataServiceClient::connect(
                 format!("http://{addr}"),
             )
-            .await
-            {
-                Ok(client) => {
-                    metadata_client = Some(client);
-                    break;
-                }
-                Err(_) => sleep(Duration::from_millis(25)).await,
-            }
-        }
-        let metadata = metadata_client.expect("connect metadata client");
+        })
+        .await;
         let state = Arc::new(SchedulerState {
             metadata,
             cache: None,
@@ -1031,6 +1304,88 @@ mod tests {
             config: SchedulerConfig::default(),
         });
         (SchedulerServiceImpl::new(state.clone()), state, shutdown_tx)
+    }
+
+    async fn metadata_and_cache_backed_service() -> (
+        Arc<SchedulerState>,
+        MetadataBackedSchedulerBackend,
+        CacheServiceClient<tonic::transport::Channel>,
+        oneshot::Sender<()>,
+        oneshot::Sender<()>,
+    ) {
+        let metadata = MetadataServiceImpl::new(&MetadataConfig::default())
+            .await
+            .expect("metadata service init");
+        let metadata_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind metadata listener");
+        let metadata_addr = metadata_listener.local_addr().expect("metadata addr");
+        drop(metadata_listener);
+
+        let cache_dir =
+            std::env::temp_dir().join(format!("coldstore-cache-test-{}", uuid::Uuid::new_v4()));
+        let cache_service = CacheServiceImpl::new(&CacheConfig {
+            listen: "127.0.0.1:0".into(),
+            metadata_addrs: vec![],
+            backend: CacheBackendConfig::Hdd {
+                path: cache_dir.to_string_lossy().into_owned(),
+                max_size_gb: 1,
+            },
+            ..CacheConfig::default()
+        })
+        .await
+        .expect("cache service init");
+        let cache_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind cache listener");
+        let cache_addr = cache_listener.local_addr().expect("cache addr");
+        drop(cache_listener);
+
+        let (metadata_shutdown_tx, metadata_shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(MetadataServiceServer::new(metadata))
+                .serve_with_shutdown(metadata_addr, async {
+                    let _ = metadata_shutdown_rx.await;
+                })
+                .await
+                .expect("metadata server should run");
+        });
+
+        let (cache_shutdown_tx, cache_shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CacheServiceServer::new(cache_service))
+                .serve_with_shutdown(cache_addr, async {
+                    let _ = cache_shutdown_rx.await;
+                })
+                .await
+                .expect("cache server should run");
+        });
+
+        let metadata = connect_with_retry(|| {
+            coldstore_proto::metadata::metadata_service_client::MetadataServiceClient::connect(
+                format!("http://{metadata_addr}"),
+            )
+        })
+        .await;
+        let cache =
+            connect_with_retry(|| CacheServiceClient::connect(format!("http://{cache_addr}")))
+                .await;
+
+        let state = Arc::new(SchedulerState {
+            metadata,
+            cache: Some(cache.clone()),
+            tape: None,
+            config: SchedulerConfig::default(),
+        });
+        let backend =
+            MetadataBackedSchedulerBackend::new(state.metadata.clone(), state.cache.clone());
+        (
+            state,
+            backend,
+            cache,
+            metadata_shutdown_tx,
+            cache_shutdown_tx,
+        )
     }
 
     #[tokio::test]
@@ -1058,7 +1413,9 @@ mod tests {
 
     #[tokio::test]
     async fn default_service_uses_metadata_for_object_metadata_ops() {
-        let (svc, state, shutdown_tx) = metadata_backed_service().await;
+        let (state, backend, mut cache, metadata_shutdown_tx, cache_shutdown_tx) =
+            metadata_and_cache_backed_service().await;
+        let svc = SchedulerServiceImpl::new(state.clone());
 
         svc.create_bucket(Request::new(CreateBucketRequest {
             bucket: "docs".into(),
@@ -1133,6 +1490,26 @@ mod tests {
             .await
             .expect("mark object as cold");
 
+        cache
+            .put_staging(Request::new(tokio_stream::iter(vec![
+                PutStagingRequest {
+                    payload: Some(put_staging_request::Payload::Meta(PutStagingMeta {
+                        bucket: "docs".into(),
+                        key: "guide.txt".into(),
+                        version_id: None,
+                        size: 5,
+                        checksum: Some("seed-checksum".into()),
+                        content_type: Some("text/plain".into()),
+                        etag: Some("seed-etag".into()),
+                    })),
+                },
+                PutStagingRequest {
+                    payload: Some(put_staging_request::Payload::Data(b"hello".to_vec())),
+                },
+            ])))
+            .await
+            .expect("seed staging cache object");
+
         let restore = svc
             .restore_object(Request::new(RestoreObjectRequest {
                 bucket: "docs".into(),
@@ -1155,10 +1532,16 @@ mod tests {
             .await
             .expect("head restored object")
             .into_inner();
-        assert_eq!(
-            restored.restore_info.as_deref(),
-            Some("ongoing-request=\"true\"")
-        );
+        assert!(restored
+            .restore_info
+            .as_deref()
+            .is_some_and(|info| info.contains("ongoing-request=\"false\"")));
+
+        let get = backend
+            .get_object("docs", "guide.txt")
+            .await
+            .expect("backend get after restore");
+        assert_eq!(get.1, b"hello");
 
         svc.delete_object(Request::new(DeleteObjectRequest {
             bucket: "docs".into(),
@@ -1177,20 +1560,202 @@ mod tests {
             .await
             .is_err());
 
-        shutdown_tx.send(()).ok();
+        metadata_shutdown_tx.send(()).ok();
+        cache_shutdown_tx.send(()).ok();
     }
 
     #[tokio::test]
-    async fn default_metadata_backend_puts_object_and_reports_cache_gap() {
-        let (_svc, state, shutdown_tx) = metadata_backed_service().await;
-        let backend = MetadataBackedSchedulerBackend::new(state.metadata.clone());
+    async fn default_metadata_backend_reads_restored_object_from_cache() {
+        let (state, backend, mut cache, metadata_shutdown_tx, cache_shutdown_tx) =
+            metadata_and_cache_backed_service().await;
 
         backend
             .create_bucket("docs")
             .await
             .expect("create bucket through metadata backend");
 
-        let put = backend
+        let expire_at = days_from_now(2);
+        state
+            .metadata
+            .clone()
+            .put_object(Request::new(common::ObjectMetadata {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+                version_id: None,
+                size: 5,
+                checksum: "seed-checksum".into(),
+                content_type: Some("text/plain".into()),
+                etag: Some("seed-etag".into()),
+                storage_class: common::StorageClass::Cold as i32,
+                archive_id: Some("archive-1".into()),
+                tape_id: Some("tape-1".into()),
+                tape_set: vec!["tape-1".into()],
+                tape_block_offset: Some(7),
+                restore_status: Some(common::RestoreStatus::RestoreCompleted as i32),
+                restore_expire_at: Some(expire_at),
+                created_at: Some(Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                updated_at: Some(Timestamp {
+                    seconds: 11,
+                    nanos: 0,
+                }),
+            }))
+            .await
+            .expect("seed object metadata");
+
+        cache
+            .put_restored(Request::new(tokio_stream::iter(vec![
+                PutRestoredRequest {
+                    payload: Some(put_restored_request::Payload::Meta(PutRestoredMeta {
+                        bucket: "docs".into(),
+                        key: "guide.txt".into(),
+                        version_id: None,
+                        size: 5,
+                        checksum: Some("seed-checksum".into()),
+                        content_type: Some("text/plain".into()),
+                        etag: Some("seed-etag".into()),
+                        expire_at: Some(days_from_now(2)),
+                    })),
+                },
+                PutRestoredRequest {
+                    payload: Some(put_restored_request::Payload::Data(b"hello".to_vec())),
+                },
+            ])))
+            .await
+            .expect("seed restored cache object");
+
+        let (object, body) = backend
+            .get_object("docs", "guide.txt")
+            .await
+            .expect("get object should read through cache");
+        assert_eq!(object.etag.as_deref(), Some("seed-etag"));
+        assert_eq!(body, b"hello");
+
+        metadata_shutdown_tx.send(()).ok();
+        cache_shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn default_metadata_backend_restore_populates_cache_and_enables_get() {
+        let (state, backend, mut cache, metadata_shutdown_tx, cache_shutdown_tx) =
+            metadata_and_cache_backed_service().await;
+
+        backend
+            .create_bucket("docs")
+            .await
+            .expect("create bucket through metadata backend");
+
+        state
+            .metadata
+            .clone()
+            .put_object(Request::new(common::ObjectMetadata {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+                version_id: None,
+                size: 5,
+                checksum: "seed-checksum".into(),
+                content_type: Some("text/plain".into()),
+                etag: Some("seed-etag".into()),
+                storage_class: common::StorageClass::Cold as i32,
+                archive_id: Some("archive-1".into()),
+                tape_id: Some("tape-1".into()),
+                tape_set: vec!["tape-1".into()],
+                tape_block_offset: Some(7),
+                restore_status: None,
+                restore_expire_at: None,
+                created_at: Some(Timestamp {
+                    seconds: 10,
+                    nanos: 0,
+                }),
+                updated_at: Some(Timestamp {
+                    seconds: 11,
+                    nanos: 0,
+                }),
+            }))
+            .await
+            .expect("seed cold object metadata");
+
+        cache
+            .put_staging(Request::new(tokio_stream::iter(vec![
+                PutStagingRequest {
+                    payload: Some(put_staging_request::Payload::Meta(PutStagingMeta {
+                        bucket: "docs".into(),
+                        key: "guide.txt".into(),
+                        version_id: None,
+                        size: 5,
+                        checksum: Some("seed-checksum".into()),
+                        content_type: Some("text/plain".into()),
+                        etag: Some("seed-etag".into()),
+                    })),
+                },
+                PutStagingRequest {
+                    payload: Some(put_staging_request::Payload::Data(b"hello".to_vec())),
+                },
+            ])))
+            .await
+            .expect("seed staging cache object");
+
+        let response = backend
+            .restore_object("docs", "guide.txt", 3, common::RestoreTier::Standard)
+            .await
+            .expect("restore object should populate cache");
+        assert_eq!(response.status_code, 202);
+
+        let contains = cache
+            .contains(Request::new(ContainsRequest {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+                version_id: None,
+            }))
+            .await
+            .expect("contains should succeed after restore")
+            .into_inner();
+        assert!(contains.exists);
+
+        let (object, body) = backend
+            .get_object("docs", "guide.txt")
+            .await
+            .expect("restored object should become readable through cache");
+        assert_eq!(
+            object.restore_status,
+            Some(common::RestoreStatus::RestoreCompleted as i32)
+        );
+        assert_eq!(body, b"hello");
+
+        let mut stream = cache
+            .get(Request::new(CacheGetRequest {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+                version_id: None,
+            }))
+            .await
+            .expect("cache get should succeed after restore")
+            .into_inner();
+        let first = stream.next().await.unwrap().unwrap();
+        match first.payload {
+            Some(coldstore_proto::cache::get_response::Payload::Meta(meta)) => {
+                assert_eq!(meta.etag.as_deref(), Some("seed-etag"));
+            }
+            _ => panic!("expected restored cache metadata"),
+        }
+
+        metadata_shutdown_tx.send(()).ok();
+        cache_shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn metadata_backed_archive_marks_cold_and_clears_staging() {
+        let (state, backend, mut cache, metadata_shutdown_tx, cache_shutdown_tx) =
+            metadata_and_cache_backed_service().await;
+
+        backend
+            .create_bucket("docs")
+            .await
+            .expect("create bucket through metadata backend");
+
+        backend
             .put_object(
                 "docs",
                 "guide.txt",
@@ -1199,23 +1764,44 @@ mod tests {
             )
             .await
             .expect("put object through metadata backend");
-        assert!(!put.etag.is_empty());
 
-        let listed = backend
-            .list_objects("docs", Some("gui"), None, 10)
+        let archived = backend
+            .archive_staging_batch(10)
             .await
-            .expect("list objects through metadata backend");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].etag.as_deref(), Some(put.etag.as_str()));
+            .expect("archive staging batch should succeed");
+        assert_eq!(archived, vec!["docs/guide.txt"]);
 
-        let err = backend
-            .get_object("docs", "guide.txt")
+        let object = state
+            .metadata
+            .clone()
+            .get_object(Request::new(coldstore_proto::metadata::GetObjectRequest {
+                bucket: "docs".into(),
+                key: "guide.txt".into(),
+            }))
             .await
-            .expect_err("get_object should explain that cache is still not wired");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("cache wiring"));
+            .expect("get archived object metadata")
+            .into_inner();
+        assert_eq!(object.storage_class, common::StorageClass::Cold as i32);
+        assert_eq!(
+            object.archive_id.as_deref(),
+            Some("phase1-archive:docs/guide.txt")
+        );
+        assert_eq!(object.tape_id.as_deref(), Some("phase1-cache-archive"));
 
-        shutdown_tx.send(()).ok();
+        let staging = cache
+            .list_staging_keys(Request::new(
+                coldstore_proto::cache::ListStagingKeysRequest {
+                    limit: 100,
+                    after: None,
+                },
+            ))
+            .await
+            .expect("list staging keys")
+            .into_inner();
+        assert!(staging.entries.is_empty());
+
+        metadata_shutdown_tx.send(()).ok();
+        cache_shutdown_tx.send(()).ok();
     }
 
     #[test]
