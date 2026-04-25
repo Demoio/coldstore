@@ -1,5 +1,8 @@
 pub mod service;
 
+#[cfg(feature = "metadata-raft")]
+pub mod raft;
+
 use anyhow::Result;
 use coldstore_common::config::MetadataConfig;
 use tonic::transport::Server;
