@@ -9,6 +9,18 @@ ColdStore 是**纯冷归档系统**（类似 AWS Glacier Deep Archive）：
 - 不提供在线热存储层，不做生命周期管理
 - 外部热存储系统在需要冷归档时调用 ColdStore 的 PutObject API
 
+## 当前实现状态
+
+当前代码基线已经进入 Phase 1 本地闭环，并开始 Phase 2A Metadata 单节点持久化：
+
+| 分期 | 状态 | 已落地能力 |
+|------|------|------------|
+| Phase 1 | 已落地 / 可单测 | Gateway/Scheduler/Metadata/Cache 本地闭环；bucket/object CRUD；Put/Head/Get/Delete/Restore/List；HDD Cache staging/restored；Phase-1 archive 标记 Cold 并清理 staging |
+| Phase 2A | 已启动 / 可单测 | Metadata opt-in 二进制 snapshot：`MetadataServiceImpl::new_with_snapshot(config, path)` 支持写入后保存、重启后恢复 bucket/object/task/worker/tape 等状态 |
+| Phase 2B | 下一步 | 将 Metadata 状态机接入 OpenRaft + RocksDB/openraft-rocksstore，补齐安全的 Raft 状态机单测和多节点一致性测试 |
+
+当前仍不会访问真实磁带设备，也不默认执行集成测试。
+
 ## Workspace 结构
 
 | Crate | 类型 | 说明 |

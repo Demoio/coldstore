@@ -3,8 +3,10 @@ use coldstore_common::config::MetadataConfig;
 use coldstore_proto::common;
 use coldstore_proto::metadata::metadata_service_server::MetadataService;
 use coldstore_proto::metadata::*;
+use prost::Message;
 use prost_types::Timestamp;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
@@ -42,6 +44,7 @@ struct MetadataState {
 pub struct MetadataServiceImpl {
     config: MetadataConfig,
     state: Arc<RwLock<MetadataState>>,
+    snapshot_path: Option<PathBuf>,
 }
 
 impl MetadataServiceImpl {
@@ -49,7 +52,34 @@ impl MetadataServiceImpl {
         Ok(Self {
             config: config.clone(),
             state: Arc::new(RwLock::new(MetadataState::default())),
+            snapshot_path: None,
         })
+    }
+
+    pub async fn new_with_snapshot(
+        config: &MetadataConfig,
+        snapshot_path: PathBuf,
+    ) -> Result<Self> {
+        let state = if tokio::fs::try_exists(&snapshot_path).await? {
+            load_snapshot(&snapshot_path).await?
+        } else {
+            MetadataState::default()
+        };
+
+        Ok(Self {
+            config: config.clone(),
+            state: Arc::new(RwLock::new(state)),
+            snapshot_path: Some(snapshot_path),
+        })
+    }
+
+    async fn persist_locked(&self, state: &MetadataState) -> std::result::Result<(), Status> {
+        if let Some(path) = &self.snapshot_path {
+            save_snapshot(path, state)
+                .await
+                .map_err(|err| Status::internal(format!("persist metadata snapshot: {err}")))?;
+        }
+        Ok(())
     }
 
     fn metadata_nodes(&self) -> Vec<common::MetadataNodeInfo> {
@@ -73,6 +103,142 @@ impl MetadataServiceImpl {
             })
             .collect()
     }
+}
+
+const SNAPSHOT_MAGIC: &[u8] = b"COLDMETA2\n";
+
+async fn load_snapshot(path: &Path) -> Result<MetadataState> {
+    let bytes = tokio::fs::read(path).await?;
+    decode_snapshot(&bytes)
+}
+
+async fn save_snapshot(path: &Path, state: &MetadataState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    tokio::fs::write(&tmp_path, encode_snapshot(state)).await?;
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+
+fn encode_snapshot(state: &MetadataState) -> Vec<u8> {
+    let mut out = SNAPSHOT_MAGIC.to_vec();
+    write_messages(&mut out, state.objects.values());
+    write_messages(&mut out, state.buckets.values());
+    write_messages(&mut out, state.archive_bundles.values());
+    write_messages(&mut out, state.archive_tasks.values());
+    write_messages(&mut out, state.recall_tasks.values());
+    write_messages(&mut out, state.tapes.values());
+    write_messages(&mut out, state.scheduler_workers.values());
+    write_messages(&mut out, state.cache_workers.values());
+    write_messages(&mut out, state.tape_workers.values());
+    out
+}
+
+fn decode_snapshot(bytes: &[u8]) -> Result<MetadataState> {
+    anyhow::ensure!(
+        bytes.starts_with(SNAPSHOT_MAGIC),
+        "invalid metadata snapshot magic"
+    );
+    let mut cursor = &bytes[SNAPSHOT_MAGIC.len()..];
+    let objects = read_messages::<common::ObjectMetadata>(&mut cursor)?;
+    let buckets = read_messages::<common::BucketInfo>(&mut cursor)?;
+    let archive_bundles = read_messages::<common::ArchiveBundle>(&mut cursor)?;
+    let archive_tasks = read_messages::<common::ArchiveTask>(&mut cursor)?;
+    let recall_tasks = read_messages::<common::RecallTask>(&mut cursor)?;
+    let tapes = read_messages::<common::TapeInfo>(&mut cursor)?;
+    let scheduler_workers = read_messages::<common::SchedulerWorkerInfo>(&mut cursor)?;
+    let cache_workers = read_messages::<common::CacheWorkerInfo>(&mut cursor)?;
+    let tape_workers = read_messages::<common::TapeWorkerInfo>(&mut cursor)?;
+    anyhow::ensure!(cursor.is_empty(), "trailing bytes in metadata snapshot");
+
+    Ok(MetadataState {
+        objects: objects
+            .into_iter()
+            .map(|object| {
+                (
+                    ObjectKey::new(
+                        object.bucket.clone(),
+                        object.key.clone(),
+                        object.version_id.clone(),
+                    ),
+                    object,
+                )
+            })
+            .collect(),
+        buckets: buckets
+            .into_iter()
+            .map(|bucket| (bucket.name.clone(), bucket))
+            .collect(),
+        archive_bundles: archive_bundles
+            .into_iter()
+            .map(|bundle| (bundle.id.clone(), bundle))
+            .collect(),
+        archive_tasks: archive_tasks
+            .into_iter()
+            .map(|task| (task.id.clone(), task))
+            .collect(),
+        recall_tasks: recall_tasks
+            .into_iter()
+            .map(|task| (task.id.clone(), task))
+            .collect(),
+        tapes: tapes
+            .into_iter()
+            .map(|tape| (tape.id.clone(), tape))
+            .collect(),
+        scheduler_workers: scheduler_workers
+            .into_iter()
+            .map(|worker| (worker.node_id, worker))
+            .collect(),
+        cache_workers: cache_workers
+            .into_iter()
+            .map(|worker| (worker.node_id, worker))
+            .collect(),
+        tape_workers: tape_workers
+            .into_iter()
+            .map(|worker| (worker.node_id, worker))
+            .collect(),
+    })
+}
+
+fn write_messages<'a, M, I>(out: &mut Vec<u8>, messages: I)
+where
+    M: Message + 'a,
+    I: IntoIterator<Item = &'a M>,
+{
+    let encoded: Vec<Vec<u8>> = messages
+        .into_iter()
+        .map(|message| message.encode_to_vec())
+        .collect();
+    out.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+    for message in encoded {
+        out.extend_from_slice(&(message.len() as u64).to_le_bytes());
+        out.extend_from_slice(&message);
+    }
+}
+
+fn read_messages<M>(cursor: &mut &[u8]) -> Result<Vec<M>>
+where
+    M: Message + Default,
+{
+    let count = read_u64(cursor)? as usize;
+    let mut messages = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = read_u64(cursor)? as usize;
+        anyhow::ensure!(cursor.len() >= len, "truncated metadata snapshot message");
+        let (message, rest) = cursor.split_at(len);
+        messages.push(M::decode(message)?);
+        *cursor = rest;
+    }
+    Ok(messages)
+}
+
+fn read_u64(cursor: &mut &[u8]) -> Result<u64> {
+    anyhow::ensure!(cursor.len() >= 8, "truncated metadata snapshot header");
+    let (bytes, rest) = cursor.split_at(8);
+    *cursor = rest;
+    Ok(u64::from_le_bytes(bytes.try_into()?))
 }
 
 #[tonic::async_trait]
@@ -103,6 +269,7 @@ impl MetadataService for MetadataServiceImpl {
         );
         state.objects.insert(key, object.clone());
         refresh_bucket_stats(&mut state, &object.bucket);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -146,6 +313,7 @@ impl MetadataService for MetadataServiceImpl {
             return Err(Status::not_found("object not found"));
         }
         refresh_bucket_stats(&mut state, &request.bucket);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -217,6 +385,7 @@ impl MetadataService for MetadataServiceImpl {
         let object = find_object_mut(&mut state, &request.bucket, &request.key, None)?;
         object.storage_class = request.storage_class;
         object.updated_at = Some(now_timestamp());
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -232,6 +401,7 @@ impl MetadataService for MetadataServiceImpl {
         object.tape_set = request.tape_set;
         object.tape_block_offset = Some(request.tape_block_offset);
         object.updated_at = Some(now_timestamp());
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -246,6 +416,7 @@ impl MetadataService for MetadataServiceImpl {
         object.restore_status = Some(request.status);
         object.restore_expire_at = request.expire_at;
         object.updated_at = Some(now_timestamp());
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -288,6 +459,7 @@ impl MetadataService for MetadataServiceImpl {
             bucket.created_at = Some(now_timestamp());
         }
         state.buckets.insert(bucket.name.clone(), bucket);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -322,6 +494,7 @@ impl MetadataService for MetadataServiceImpl {
             .buckets
             .remove(&request.name)
             .ok_or_else(|| Status::not_found(format!("bucket not found: {}", request.name)))?;
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -345,6 +518,7 @@ impl MetadataService for MetadataServiceImpl {
         }
         let mut state = self.state.write().await;
         state.archive_bundles.insert(bundle.id.clone(), bundle);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -377,6 +551,7 @@ impl MetadataService for MetadataServiceImpl {
         if request.status == common::ArchiveBundleStatus::BundleCompleted as i32 {
             bundle.completed_at = Some(now_timestamp());
         }
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -405,6 +580,7 @@ impl MetadataService for MetadataServiceImpl {
         }
         let mut state = self.state.write().await;
         state.archive_tasks.insert(task.id.clone(), task);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -434,6 +610,7 @@ impl MetadataService for MetadataServiceImpl {
             .ok_or_else(|| Status::not_found("archive task not found"))?;
         validate_archive_task_transition(current.status, task.status)?;
         state.archive_tasks.insert(task.id.clone(), task);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -467,6 +644,7 @@ impl MetadataService for MetadataServiceImpl {
         }
         let mut state = self.state.write().await;
         state.recall_tasks.insert(task.id.clone(), task);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -496,6 +674,7 @@ impl MetadataService for MetadataServiceImpl {
             .ok_or_else(|| Status::not_found("recall task not found"))?;
         validate_restore_transition(Some(current.status), task.status)?;
         state.recall_tasks.insert(task.id.clone(), task);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -632,6 +811,7 @@ impl MetadataService for MetadataServiceImpl {
         worker.last_heartbeat = Some(now_timestamp());
         let mut state = self.state.write().await;
         state.scheduler_workers.insert(worker.node_id, worker);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -642,6 +822,7 @@ impl MetadataService for MetadataServiceImpl {
         let request = request.into_inner();
         let mut state = self.state.write().await;
         state.scheduler_workers.remove(&request.node_id);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -667,6 +848,7 @@ impl MetadataService for MetadataServiceImpl {
         worker.last_heartbeat = Some(now_timestamp());
         let mut state = self.state.write().await;
         state.cache_workers.insert(worker.node_id, worker);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -677,6 +859,7 @@ impl MetadataService for MetadataServiceImpl {
         let request = request.into_inner();
         let mut state = self.state.write().await;
         state.cache_workers.remove(&request.node_id);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -702,6 +885,7 @@ impl MetadataService for MetadataServiceImpl {
         worker.last_heartbeat = Some(now_timestamp());
         let mut state = self.state.write().await;
         state.tape_workers.insert(worker.node_id, worker);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -712,6 +896,7 @@ impl MetadataService for MetadataServiceImpl {
         let request = request.into_inner();
         let mut state = self.state.write().await;
         state.tape_workers.remove(&request.node_id);
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -751,6 +936,7 @@ impl MetadataService for MetadataServiceImpl {
             _ => None,
         }
         .ok_or_else(|| Status::not_found("worker not found"))?;
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 
@@ -813,6 +999,7 @@ impl MetadataService for MetadataServiceImpl {
             _ => return Err(Status::invalid_argument("unknown worker type")),
         }
 
+        self.persist_locked(&state).await?;
         Ok(Response::new(()))
     }
 }
@@ -1167,6 +1354,56 @@ mod tests {
             .into_inner();
         assert_eq!(bucket.object_count, 1);
         assert_eq!(bucket.total_size, 5);
+    }
+
+    #[tokio::test]
+    async fn persistent_snapshot_survives_service_restart() {
+        let snapshot_path = std::env::temp_dir().join(format!(
+            "coldstore-metadata-snapshot-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+
+        let svc = MetadataServiceImpl::new_with_snapshot(
+            &MetadataConfig::default(),
+            snapshot_path.clone(),
+        )
+        .await
+        .expect("persistent service init");
+        svc.create_bucket(Request::new(test_bucket("docs")))
+            .await
+            .expect("create bucket");
+        svc.put_object(Request::new(test_object("docs", "readme.txt")))
+            .await
+            .expect("put object");
+
+        let restarted = MetadataServiceImpl::new_with_snapshot(
+            &MetadataConfig::default(),
+            snapshot_path.clone(),
+        )
+        .await
+        .expect("persistent service restart");
+
+        let bucket = restarted
+            .get_bucket(Request::new(GetBucketRequest {
+                name: "docs".into(),
+            }))
+            .await
+            .expect("bucket should be loaded from snapshot")
+            .into_inner();
+        assert_eq!(bucket.object_count, 1);
+        assert_eq!(bucket.total_size, 5);
+
+        let object = restarted
+            .get_object(Request::new(GetObjectRequest {
+                bucket: "docs".into(),
+                key: "readme.txt".into(),
+            }))
+            .await
+            .expect("object should be loaded from snapshot")
+            .into_inner();
+        assert_eq!(object.checksum, "sum");
+
+        let _ = tokio::fs::remove_file(snapshot_path).await;
     }
 
     #[tokio::test]

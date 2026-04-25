@@ -19,8 +19,10 @@
 
 | 分期 | 状态 | 说明 |
 |------|------|------|
-| **Phase 1（当前代码基线）** | 已落地 / 可单测 | Metadata 使用内存状态机；Cache 使用 HDD 后端 + 进程内索引；Scheduler/Tape 对未完成路径返回显式 `UNIMPLEMENTED`；仅保证编译、静态检查与单元测试 |
-| **Phase 2（目标架构）** | 设计目标 | Metadata 切换到 OpenRaft + RocksDB；Cache 支持 SPDK；Tape 接入真实 SCSI/LTFS/厂商 SDK；补齐跨进程集成测试 |
+| **Phase 1（当前代码基线）** | 已落地 / 可单测 | Gateway/Scheduler/Metadata/Cache 已形成安全本地闭环：bucket/object CRUD、PutObject、HeadObject、GetObject、DeleteObject、RestoreObject、ListObjects、HDD Cache staging/restored、Phase-1 archive 标记与 staging 清理均有单元测试覆盖；Tape 仍不访问真实设备 |
+| **Phase 2A（当前推进）** | 已启动 / 本地持久化 | Metadata 增加 opt-in 二进制 snapshot 持久化入口，服务重启后可恢复 bucket/object/worker/task/tape 等内存状态；该阶段仍是单节点本地持久化，不等同于 Raft 共识 |
+| **Phase 2B（下一步目标）** | 设计目标 | Metadata 将 snapshot/状态机演进为 OpenRaft state machine + Raft log，存储后端切换到 RocksDB/openraft-rocksstore；随后补齐安全的多节点一致性测试 |
+| **Phase 3（目标架构）** | 设计目标 | Cache 支持 SPDK；Tape 接入真实 SCSI/LTFS/厂商 SDK；补齐跨进程集成测试和真实设备验证 |
 
 Phase 1 的设计原则：
 - 不访问真实磁带设备
@@ -28,7 +30,7 @@ Phase 1 的设计原则：
 - 不执行会改变主机外部环境的集成测试
 - 先把协议对象、状态流转、缓存读写、元数据 CRUD 做成可验证的本地能力
 
-因此，本文档中凡涉及 Raft、RocksDB、SPDK、真实带库控制的内容，均视为 **目标态设计**；凡涉及内存版 Metadata、HDD Cache、显式 `UNIMPLEMENTED` 边界的内容，均视为 **当前实现态设计**。
+因此，本文档中凡涉及 SPDK、真实带库控制的内容，均视为 **目标态设计**；凡涉及 Gateway/Scheduler/Metadata/Cache 的本地闭环能力，均视为 **Phase 1 当前实现态设计**；凡涉及 Metadata snapshot 持久化能力，均视为 **Phase 2A 当前推进态设计**；凡涉及 OpenRaft、RocksDB 复制日志和多节点一致性的内容，均视为 **Phase 2B 目标态设计**。
 
 ### 1.1 核心技术选型（已确定）
 
@@ -117,12 +119,14 @@ Gateway 仅连接 Scheduler Worker，Console 仅连接 Metadata。
 
 **目标态**中，Scheduler Worker 是唯一的元数据业务读写入口（Console 管控除外），Gateway、Cache Worker、Tape Worker 均不直接访问 Metadata。
 
-**当前实现态（Phase 1）**中，真正落地并可被单元测试验证的是：
-- MetadataService 的进程内内存状态机实现
-- CacheService 的 HDD 本地缓存实现
-- Scheduler/Tape 的显式未实现边界
+**当前实现态（Phase 1 + Phase 2A 起步）**中，真正落地并可被单元测试验证的是：
+- MetadataService 的进程内状态机实现，覆盖 bucket/object/archive bundle/archive task/recall task/tape/worker registry 等元数据 CRUD 与状态流转
+- MetadataService 的 opt-in 本地 snapshot 持久化入口：`MetadataServiceImpl::new_with_snapshot(config, path)` 会在写入后保存二进制 snapshot，并在重启时恢复状态
+- CacheService 的 HDD 本地缓存实现，覆盖 staging/restored 数据写入、读取、列举和删除
+- Gateway/Scheduler/Metadata/Cache 的 Phase-1 安全闭环：bucket 操作、object put/head/get/delete/list、restore 后读、archive staging batch 标记 cold 并清理 staging
+- Tape Worker 仍不访问真实 `/dev/nst*`/`/dev/sg*` 设备；真实磁带读写留在后续阶段
 
-也就是说，当前代码基线验证的是“协议和状态语义正确性”，不是“完整分布式系统联调”。
+也就是说，当前代码基线已经验证“协议、状态语义和本地数据路径闭环”，并开始验证“Metadata 单节点持久化”；但还没有验证“完整分布式 Raft 集群、一致性复制、真实硬件 I/O”。
 
 ```
                                 Console ──管控读写──▶ Metadata
