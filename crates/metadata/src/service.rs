@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
-struct ObjectKey {
+pub(crate) struct ObjectKey {
     bucket: String,
     key: String,
     version_id: Option<String>,
@@ -28,23 +28,271 @@ impl ObjectKey {
     }
 }
 
-#[derive(Default)]
-struct MetadataState {
-    objects: HashMap<ObjectKey, common::ObjectMetadata>,
-    buckets: HashMap<String, common::BucketInfo>,
-    archive_bundles: HashMap<String, common::ArchiveBundle>,
-    archive_tasks: HashMap<String, common::ArchiveTask>,
-    recall_tasks: HashMap<String, common::RecallTask>,
-    tapes: HashMap<String, common::TapeInfo>,
-    scheduler_workers: HashMap<u64, common::SchedulerWorkerInfo>,
-    cache_workers: HashMap<u64, common::CacheWorkerInfo>,
-    tape_workers: HashMap<u64, common::TapeWorkerInfo>,
+#[derive(Default, Clone)]
+pub(crate) struct MetadataState {
+    pub(crate) objects: HashMap<ObjectKey, common::ObjectMetadata>,
+    pub(crate) buckets: HashMap<String, common::BucketInfo>,
+    pub(crate) archive_bundles: HashMap<String, common::ArchiveBundle>,
+    pub(crate) archive_tasks: HashMap<String, common::ArchiveTask>,
+    pub(crate) recall_tasks: HashMap<String, common::RecallTask>,
+    pub(crate) tapes: HashMap<String, common::TapeInfo>,
+    pub(crate) scheduler_workers: HashMap<u64, common::SchedulerWorkerInfo>,
+    pub(crate) cache_workers: HashMap<u64, common::CacheWorkerInfo>,
+    pub(crate) tape_workers: HashMap<u64, common::TapeWorkerInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum MetadataCommand {
+    PutObject(common::ObjectMetadata),
+    DeleteObject(DeleteObjectRequest),
+    UpdateStorageClass(UpdateStorageClassRequest),
+    UpdateArchiveLocation(UpdateArchiveLocationRequest),
+    UpdateRestoreStatus(UpdateRestoreStatusRequest),
+    CreateBucket(common::BucketInfo),
+    DeleteBucket(DeleteBucketRequest),
+    PutArchiveBundle(common::ArchiveBundle),
+    UpdateArchiveBundleStatus(UpdateArchiveBundleStatusRequest),
+    PutArchiveTask(common::ArchiveTask),
+    UpdateArchiveTask(common::ArchiveTask),
+    PutRecallTask(common::RecallTask),
+    UpdateRecallTask(common::RecallTask),
+    PutTape(common::TapeInfo),
+    UpdateTape(common::TapeInfo),
+    RegisterSchedulerWorker(common::SchedulerWorkerInfo),
+    DeregisterSchedulerWorker(DeregisterWorkerRequest),
+    RegisterCacheWorker(common::CacheWorkerInfo),
+    DeregisterCacheWorker(DeregisterWorkerRequest),
+    RegisterTapeWorker(common::TapeWorkerInfo),
+    DeregisterTapeWorker(DeregisterWorkerRequest),
+    UpdateWorkerStatus(UpdateWorkerStatusRequest),
+    Heartbeat(HeartbeatRequest),
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn apply_command(
+    state: &mut MetadataState,
+    command: MetadataCommand,
+) -> std::result::Result<(), Status> {
+    match command {
+        MetadataCommand::PutObject(mut object) => {
+            if !state.buckets.contains_key(&object.bucket) {
+                return Err(Status::not_found(format!(
+                    "bucket not found: {}",
+                    object.bucket
+                )));
+            }
+            let now = now_timestamp();
+            if object.created_at.is_none() {
+                object.created_at = Some(now);
+            }
+            object.updated_at = Some(now);
+            let key = ObjectKey::new(
+                object.bucket.clone(),
+                object.key.clone(),
+                object.version_id.clone(),
+            );
+            state.objects.insert(key, object.clone());
+            refresh_bucket_stats(state, &object.bucket);
+        }
+        MetadataCommand::DeleteObject(request) => {
+            let removed = state.objects.remove(&ObjectKey::new(
+                request.bucket.clone(),
+                request.key.clone(),
+                None,
+            ));
+            if removed.is_none() {
+                return Err(Status::not_found("object not found"));
+            }
+            refresh_bucket_stats(state, &request.bucket);
+        }
+        MetadataCommand::UpdateStorageClass(request) => {
+            let object = find_object_mut(state, &request.bucket, &request.key, None)?;
+            object.storage_class = request.storage_class;
+            object.updated_at = Some(now_timestamp());
+        }
+        MetadataCommand::UpdateArchiveLocation(request) => {
+            let object = find_object_mut(state, &request.bucket, &request.key, None)?;
+            object.archive_id = Some(request.archive_id);
+            object.tape_id = Some(request.tape_id);
+            object.tape_set = request.tape_set;
+            object.tape_block_offset = Some(request.tape_block_offset);
+            object.updated_at = Some(now_timestamp());
+        }
+        MetadataCommand::UpdateRestoreStatus(request) => {
+            let object = find_object_mut(state, &request.bucket, &request.key, None)?;
+            validate_restore_transition(object.restore_status, request.status)?;
+            object.restore_status = Some(request.status);
+            object.restore_expire_at = request.expire_at;
+            object.updated_at = Some(now_timestamp());
+        }
+        MetadataCommand::CreateBucket(mut bucket) => {
+            if state.buckets.contains_key(&bucket.name) {
+                return Err(Status::already_exists(format!(
+                    "bucket already exists: {}",
+                    bucket.name
+                )));
+            }
+            if bucket.created_at.is_none() {
+                bucket.created_at = Some(now_timestamp());
+            }
+            state.buckets.insert(bucket.name.clone(), bucket);
+        }
+        MetadataCommand::DeleteBucket(request) => {
+            let has_objects = state
+                .objects
+                .values()
+                .any(|object| object.bucket == request.name);
+            if has_objects {
+                return Err(Status::failed_precondition("bucket is not empty"));
+            }
+            state
+                .buckets
+                .remove(&request.name)
+                .ok_or_else(|| Status::not_found(format!("bucket not found: {}", request.name)))?;
+        }
+        MetadataCommand::PutArchiveBundle(mut bundle) => {
+            if bundle.created_at.is_none() {
+                bundle.created_at = Some(now_timestamp());
+            }
+            state.archive_bundles.insert(bundle.id.clone(), bundle);
+        }
+        MetadataCommand::UpdateArchiveBundleStatus(request) => {
+            let bundle = state
+                .archive_bundles
+                .get_mut(&request.id)
+                .ok_or_else(|| Status::not_found("archive bundle not found"))?;
+            validate_archive_bundle_transition(bundle.status, request.status)?;
+            bundle.status = request.status;
+            if request.status == common::ArchiveBundleStatus::BundleCompleted as i32 {
+                bundle.completed_at = Some(now_timestamp());
+            }
+        }
+        MetadataCommand::PutArchiveTask(mut task) => {
+            if task.created_at.is_none() {
+                task.created_at = Some(now_timestamp());
+            }
+            state.archive_tasks.insert(task.id.clone(), task);
+        }
+        MetadataCommand::UpdateArchiveTask(task) => {
+            let current = state
+                .archive_tasks
+                .get(&task.id)
+                .ok_or_else(|| Status::not_found("archive task not found"))?;
+            validate_archive_task_transition(current.status, task.status)?;
+            state.archive_tasks.insert(task.id.clone(), task);
+        }
+        MetadataCommand::PutRecallTask(mut task) => {
+            if task.created_at.is_none() {
+                task.created_at = Some(now_timestamp());
+            }
+            state.recall_tasks.insert(task.id.clone(), task);
+        }
+        MetadataCommand::UpdateRecallTask(task) => {
+            let current = state
+                .recall_tasks
+                .get(&task.id)
+                .ok_or_else(|| Status::not_found("recall task not found"))?;
+            validate_restore_transition(Some(current.status), task.status)?;
+            state.recall_tasks.insert(task.id.clone(), task);
+        }
+        MetadataCommand::PutTape(mut tape) => {
+            if tape.registered_at.is_none() {
+                tape.registered_at = Some(now_timestamp());
+            }
+            state.tapes.insert(tape.id.clone(), tape);
+        }
+        MetadataCommand::UpdateTape(tape) => {
+            state.tapes.insert(tape.id.clone(), tape);
+        }
+        MetadataCommand::RegisterSchedulerWorker(mut worker) => {
+            worker.last_heartbeat = Some(now_timestamp());
+            state.scheduler_workers.insert(worker.node_id, worker);
+        }
+        MetadataCommand::DeregisterSchedulerWorker(request) => {
+            state.scheduler_workers.remove(&request.node_id);
+        }
+        MetadataCommand::RegisterCacheWorker(mut worker) => {
+            worker.last_heartbeat = Some(now_timestamp());
+            state.cache_workers.insert(worker.node_id, worker);
+        }
+        MetadataCommand::DeregisterCacheWorker(request) => {
+            state.cache_workers.remove(&request.node_id);
+        }
+        MetadataCommand::RegisterTapeWorker(mut worker) => {
+            worker.last_heartbeat = Some(now_timestamp());
+            state.tape_workers.insert(worker.node_id, worker);
+        }
+        MetadataCommand::DeregisterTapeWorker(request) => {
+            state.tape_workers.remove(&request.node_id);
+        }
+        MetadataCommand::UpdateWorkerStatus(request) => {
+            match common::WorkerType::try_from(request.worker_type) {
+                Ok(common::WorkerType::WorkerScheduler) => state
+                    .scheduler_workers
+                    .get_mut(&request.node_id)
+                    .map(|worker| worker.status = request.status),
+                Ok(common::WorkerType::WorkerCache) => state
+                    .cache_workers
+                    .get_mut(&request.node_id)
+                    .map(|worker| worker.status = request.status),
+                Ok(common::WorkerType::WorkerTape) => state
+                    .tape_workers
+                    .get_mut(&request.node_id)
+                    .map(|worker| worker.status = request.status),
+                _ => None,
+            }
+            .ok_or_else(|| Status::not_found("worker not found"))?;
+        }
+        MetadataCommand::Heartbeat(request) => {
+            let now = Some(now_timestamp());
+            match common::WorkerType::try_from(request.worker_type) {
+                Ok(common::WorkerType::WorkerScheduler) => {
+                    let worker = state
+                        .scheduler_workers
+                        .get_mut(&request.node_id)
+                        .ok_or_else(|| Status::not_found("scheduler worker not found"))?;
+                    worker.last_heartbeat = now;
+                    if let Some(heartbeat_request::Payload::Scheduler(payload)) = request.payload {
+                        worker.pending_archive_tasks = payload.pending_archive_tasks;
+                        worker.pending_recall_tasks = payload.pending_recall_tasks;
+                        worker.active_jobs = payload.active_jobs;
+                    }
+                }
+                Ok(common::WorkerType::WorkerCache) => {
+                    let worker = state
+                        .cache_workers
+                        .get_mut(&request.node_id)
+                        .ok_or_else(|| Status::not_found("cache worker not found"))?;
+                    worker.last_heartbeat = now;
+                    if let Some(heartbeat_request::Payload::Cache(payload)) = request.payload {
+                        worker.used_capacity = payload.used_capacity;
+                        worker.blob_count = payload.blob_count;
+                    }
+                }
+                Ok(common::WorkerType::WorkerTape) => {
+                    let worker = state
+                        .tape_workers
+                        .get_mut(&request.node_id)
+                        .ok_or_else(|| Status::not_found("tape worker not found"))?;
+                    worker.last_heartbeat = now;
+                    if let Some(heartbeat_request::Payload::Tape(payload)) = request.payload {
+                        worker.drives = payload.drives;
+                    }
+                }
+                _ => return Err(Status::invalid_argument("unknown worker type")),
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub struct MetadataServiceImpl {
     config: MetadataConfig,
     state: Arc<RwLock<MetadataState>>,
     snapshot_path: Option<PathBuf>,
+    #[cfg(feature = "metadata-raft")]
+    raft_backend: Option<Arc<crate::raft::RaftMetadataBackend>>,
 }
 
 impl MetadataServiceImpl {
@@ -53,6 +301,8 @@ impl MetadataServiceImpl {
             config: config.clone(),
             state: Arc::new(RwLock::new(MetadataState::default())),
             snapshot_path: None,
+            #[cfg(feature = "metadata-raft")]
+            raft_backend: None,
         })
     }
 
@@ -70,6 +320,22 @@ impl MetadataServiceImpl {
             config: config.clone(),
             state: Arc::new(RwLock::new(state)),
             snapshot_path: Some(snapshot_path),
+            #[cfg(feature = "metadata-raft")]
+            raft_backend: None,
+        })
+    }
+
+    #[cfg(feature = "metadata-raft")]
+    #[allow(dead_code)]
+    pub(crate) async fn new_with_raft_backend(
+        config: &MetadataConfig,
+        raft_backend: Arc<crate::raft::RaftMetadataBackend>,
+    ) -> Result<Self> {
+        Ok(Self {
+            config: config.clone(),
+            state: Arc::new(RwLock::new(MetadataState::default())),
+            snapshot_path: None,
+            raft_backend: Some(raft_backend),
         })
     }
 
@@ -80,6 +346,24 @@ impl MetadataServiceImpl {
                 .map_err(|err| Status::internal(format!("persist metadata snapshot: {err}")))?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn apply_and_persist(
+        &self,
+        command: MetadataCommand,
+    ) -> std::result::Result<(), Status> {
+        #[cfg(feature = "metadata-raft")]
+        if let Some(raft_backend) = &self.raft_backend {
+            raft_backend
+                .propose_local_apply(&self.state, command)
+                .await?;
+            let state = self.state.read().await;
+            return self.persist_locked(&state).await;
+        }
+
+        let mut state = self.state.write().await;
+        apply_command(&mut state, command)?;
+        self.persist_locked(&state).await
     }
 
     fn metadata_nodes(&self) -> Vec<common::MetadataNodeInfo> {
@@ -122,7 +406,7 @@ async fn save_snapshot(path: &Path, state: &MetadataState) -> Result<()> {
     Ok(())
 }
 
-fn encode_snapshot(state: &MetadataState) -> Vec<u8> {
+pub(crate) fn encode_snapshot(state: &MetadataState) -> Vec<u8> {
     let mut out = SNAPSHOT_MAGIC.to_vec();
     write_messages(&mut out, state.objects.values());
     write_messages(&mut out, state.buckets.values());
@@ -136,7 +420,7 @@ fn encode_snapshot(state: &MetadataState) -> Vec<u8> {
     out
 }
 
-fn decode_snapshot(bytes: &[u8]) -> Result<MetadataState> {
+pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<MetadataState> {
     anyhow::ensure!(
         bytes.starts_with(SNAPSHOT_MAGIC),
         "invalid metadata snapshot magic"
@@ -247,29 +531,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::ObjectMetadata>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut object = request.into_inner();
-        let mut state = self.state.write().await;
-        if !state.buckets.contains_key(&object.bucket) {
-            return Err(Status::not_found(format!(
-                "bucket not found: {}",
-                object.bucket
-            )));
-        }
-
-        let now = now_timestamp();
-        if object.created_at.is_none() {
-            object.created_at = Some(now);
-        }
-        object.updated_at = Some(now);
-
-        let key = ObjectKey::new(
-            object.bucket.clone(),
-            object.key.clone(),
-            object.version_id.clone(),
-        );
-        state.objects.insert(key, object.clone());
-        refresh_bucket_stats(&mut state, &object.bucket);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::PutObject(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -302,18 +565,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeleteObjectRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let removed = state.objects.remove(&ObjectKey::new(
-            request.bucket.clone(),
-            request.key.clone(),
-            None,
-        ));
-        if removed.is_none() {
-            return Err(Status::not_found("object not found"));
-        }
-        refresh_bucket_stats(&mut state, &request.bucket);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::DeleteObject(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -380,12 +633,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateStorageClassRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let object = find_object_mut(&mut state, &request.bucket, &request.key, None)?;
-        object.storage_class = request.storage_class;
-        object.updated_at = Some(now_timestamp());
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::UpdateStorageClass(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -393,15 +642,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateArchiveLocationRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let object = find_object_mut(&mut state, &request.bucket, &request.key, None)?;
-        object.archive_id = Some(request.archive_id);
-        object.tape_id = Some(request.tape_id);
-        object.tape_set = request.tape_set;
-        object.tape_block_offset = Some(request.tape_block_offset);
-        object.updated_at = Some(now_timestamp());
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::UpdateArchiveLocation(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -409,14 +651,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateRestoreStatusRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let object = find_object_mut(&mut state, &request.bucket, &request.key, None)?;
-        validate_restore_transition(object.restore_status, request.status)?;
-        object.restore_status = Some(request.status);
-        object.restore_expire_at = request.expire_at;
-        object.updated_at = Some(now_timestamp());
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::UpdateRestoreStatus(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -447,19 +683,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::BucketInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut bucket = request.into_inner();
-        let mut state = self.state.write().await;
-        if state.buckets.contains_key(&bucket.name) {
-            return Err(Status::already_exists(format!(
-                "bucket already exists: {}",
-                bucket.name
-            )));
-        }
-        if bucket.created_at.is_none() {
-            bucket.created_at = Some(now_timestamp());
-        }
-        state.buckets.insert(bucket.name.clone(), bucket);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::CreateBucket(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -481,20 +706,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeleteBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let has_objects = state
-            .objects
-            .values()
-            .any(|object| object.bucket == request.name);
-        if has_objects {
-            return Err(Status::failed_precondition("bucket is not empty"));
-        }
-        state
-            .buckets
-            .remove(&request.name)
-            .ok_or_else(|| Status::not_found(format!("bucket not found: {}", request.name)))?;
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::DeleteBucket(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -512,13 +725,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::ArchiveBundle>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut bundle = request.into_inner();
-        if bundle.created_at.is_none() {
-            bundle.created_at = Some(now_timestamp());
-        }
-        let mut state = self.state.write().await;
-        state.archive_bundles.insert(bundle.id.clone(), bundle);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::PutArchiveBundle(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -540,18 +748,10 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateArchiveBundleStatusRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let bundle = state
-            .archive_bundles
-            .get_mut(&request.id)
-            .ok_or_else(|| Status::not_found("archive bundle not found"))?;
-        validate_archive_bundle_transition(bundle.status, request.status)?;
-        bundle.status = request.status;
-        if request.status == common::ArchiveBundleStatus::BundleCompleted as i32 {
-            bundle.completed_at = Some(now_timestamp());
-        }
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::UpdateArchiveBundleStatus(
+            request.into_inner(),
+        ))
+        .await?;
         Ok(Response::new(()))
     }
 
@@ -574,13 +774,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::ArchiveTask>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut task = request.into_inner();
-        if task.created_at.is_none() {
-            task.created_at = Some(now_timestamp());
-        }
-        let mut state = self.state.write().await;
-        state.archive_tasks.insert(task.id.clone(), task);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::PutArchiveTask(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -602,15 +797,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::ArchiveTask>,
     ) -> std::result::Result<Response<()>, Status> {
-        let task = request.into_inner();
-        let mut state = self.state.write().await;
-        let current = state
-            .archive_tasks
-            .get(&task.id)
-            .ok_or_else(|| Status::not_found("archive task not found"))?;
-        validate_archive_task_transition(current.status, task.status)?;
-        state.archive_tasks.insert(task.id.clone(), task);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::UpdateArchiveTask(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -638,13 +826,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::RecallTask>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut task = request.into_inner();
-        if task.created_at.is_none() {
-            task.created_at = Some(now_timestamp());
-        }
-        let mut state = self.state.write().await;
-        state.recall_tasks.insert(task.id.clone(), task);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::PutRecallTask(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -666,15 +849,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::RecallTask>,
     ) -> std::result::Result<Response<()>, Status> {
-        let task = request.into_inner();
-        let mut state = self.state.write().await;
-        let current = state
-            .recall_tasks
-            .get(&task.id)
-            .ok_or_else(|| Status::not_found("recall task not found"))?;
-        validate_restore_transition(Some(current.status), task.status)?;
-        state.recall_tasks.insert(task.id.clone(), task);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::UpdateRecallTask(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -729,12 +905,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::TapeInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut tape = request.into_inner();
-        if tape.registered_at.is_none() {
-            tape.registered_at = Some(now_timestamp());
-        }
-        let mut state = self.state.write().await;
-        state.tapes.insert(tape.id.clone(), tape);
+        self.apply_and_persist(MetadataCommand::PutTape(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -756,9 +928,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::TapeInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let tape = request.into_inner();
-        let mut state = self.state.write().await;
-        state.tapes.insert(tape.id.clone(), tape);
+        self.apply_and_persist(MetadataCommand::UpdateTape(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -807,11 +978,10 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::SchedulerWorkerInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut worker = request.into_inner();
-        worker.last_heartbeat = Some(now_timestamp());
-        let mut state = self.state.write().await;
-        state.scheduler_workers.insert(worker.node_id, worker);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::RegisterSchedulerWorker(
+            request.into_inner(),
+        ))
+        .await?;
         Ok(Response::new(()))
     }
 
@@ -819,10 +989,10 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeregisterWorkerRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        state.scheduler_workers.remove(&request.node_id);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::DeregisterSchedulerWorker(
+            request.into_inner(),
+        ))
+        .await?;
         Ok(Response::new(()))
     }
 
@@ -844,11 +1014,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::CacheWorkerInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut worker = request.into_inner();
-        worker.last_heartbeat = Some(now_timestamp());
-        let mut state = self.state.write().await;
-        state.cache_workers.insert(worker.node_id, worker);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::RegisterCacheWorker(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -856,10 +1023,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeregisterWorkerRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        state.cache_workers.remove(&request.node_id);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::DeregisterCacheWorker(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -881,11 +1046,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::TapeWorkerInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut worker = request.into_inner();
-        worker.last_heartbeat = Some(now_timestamp());
-        let mut state = self.state.write().await;
-        state.tape_workers.insert(worker.node_id, worker);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::RegisterTapeWorker(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -893,10 +1055,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeregisterWorkerRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        state.tape_workers.remove(&request.node_id);
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::DeregisterTapeWorker(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -918,25 +1078,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateWorkerStatusRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        match common::WorkerType::try_from(request.worker_type) {
-            Ok(common::WorkerType::WorkerScheduler) => state
-                .scheduler_workers
-                .get_mut(&request.node_id)
-                .map(|worker| worker.status = request.status),
-            Ok(common::WorkerType::WorkerCache) => state
-                .cache_workers
-                .get_mut(&request.node_id)
-                .map(|worker| worker.status = request.status),
-            Ok(common::WorkerType::WorkerTape) => state
-                .tape_workers
-                .get_mut(&request.node_id)
-                .map(|worker| worker.status = request.status),
-            _ => None,
-        }
-        .ok_or_else(|| Status::not_found("worker not found"))?;
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::UpdateWorkerStatus(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -958,48 +1101,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let now = Some(now_timestamp());
-        let mut state = self.state.write().await;
-
-        match common::WorkerType::try_from(request.worker_type) {
-            Ok(common::WorkerType::WorkerScheduler) => {
-                let worker = state
-                    .scheduler_workers
-                    .get_mut(&request.node_id)
-                    .ok_or_else(|| Status::not_found("scheduler worker not found"))?;
-                worker.last_heartbeat = now;
-                if let Some(heartbeat_request::Payload::Scheduler(payload)) = request.payload {
-                    worker.pending_archive_tasks = payload.pending_archive_tasks;
-                    worker.pending_recall_tasks = payload.pending_recall_tasks;
-                    worker.active_jobs = payload.active_jobs;
-                }
-            }
-            Ok(common::WorkerType::WorkerCache) => {
-                let worker = state
-                    .cache_workers
-                    .get_mut(&request.node_id)
-                    .ok_or_else(|| Status::not_found("cache worker not found"))?;
-                worker.last_heartbeat = now;
-                if let Some(heartbeat_request::Payload::Cache(payload)) = request.payload {
-                    worker.used_capacity = payload.used_capacity;
-                    worker.blob_count = payload.blob_count;
-                }
-            }
-            Ok(common::WorkerType::WorkerTape) => {
-                let worker = state
-                    .tape_workers
-                    .get_mut(&request.node_id)
-                    .ok_or_else(|| Status::not_found("tape worker not found"))?;
-                worker.last_heartbeat = now;
-                if let Some(heartbeat_request::Payload::Tape(payload)) = request.payload {
-                    worker.drives = payload.drives;
-                }
-            }
-            _ => return Err(Status::invalid_argument("unknown worker type")),
-        }
-
-        self.persist_locked(&state).await?;
+        self.apply_and_persist(MetadataCommand::Heartbeat(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 }
@@ -1274,6 +1377,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn metadata_command_create_bucket_rejects_duplicate_names() {
+        let mut state = MetadataState::default();
+        apply_command(
+            &mut state,
+            MetadataCommand::CreateBucket(test_bucket("docs")),
+        )
+        .expect("first create succeeds");
+
+        let err = apply_command(
+            &mut state,
+            MetadataCommand::CreateBucket(test_bucket("docs")),
+        )
+        .expect_err("duplicate bucket should fail");
+
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert_eq!(state.buckets.len(), 1);
+    }
+
     #[tokio::test]
     async fn create_and_get_bucket_round_trip() {
         let svc = MetadataServiceImpl::new(&MetadataConfig::default())
@@ -1446,5 +1568,31 @@ mod tests {
         assert_eq!(cluster.scheduler_workers[0].pending_archive_tasks, 3);
         assert_eq!(cluster.scheduler_workers[0].pending_recall_tasks, 2);
         assert_eq!(cluster.scheduler_workers[0].active_jobs, 1);
+    }
+
+    #[cfg(feature = "metadata-raft")]
+    #[tokio::test]
+    async fn metadata_service_raft_mode_routes_writes_through_propose_backend() {
+        let raft_backend = Arc::new(crate::raft::RaftMetadataBackend::new());
+        let svc = MetadataServiceImpl::new_with_raft_backend(
+            &MetadataConfig::default(),
+            raft_backend.clone(),
+        )
+        .await
+        .expect("raft-backed service init");
+
+        svc.create_bucket(Request::new(test_bucket("docs")))
+            .await
+            .expect("create bucket through propose backend");
+
+        assert_eq!(raft_backend.proposed_commands().await, 1);
+        let got = svc
+            .get_bucket(Request::new(GetBucketRequest {
+                name: "docs".into(),
+            }))
+            .await
+            .expect("bucket should be visible after proposed apply")
+            .into_inner();
+        assert_eq!(got.name, "docs");
     }
 }
