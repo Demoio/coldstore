@@ -25,6 +25,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 config = { workspace = true }
 
-# TODO: Phase 2 - Raft + RocksDB
+# Phase 2A starts with opt-in local binary snapshot persistence in service.rs.
+# Phase 2B will enable Raft + RocksDB behind a feature flag before making it default.
 # openraft = "0.10"
 # rocksdb = "0.22"
