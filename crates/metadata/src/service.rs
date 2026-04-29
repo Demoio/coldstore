@@ -1,47 +1,24 @@
+use crate::command::MetadataCommand;
+use crate::state_machine::{
+    find_object, is_active_restore_status, is_pending_restore_status, load_snapshot, now_timestamp,
+    save_snapshot, MetadataState, MetadataStateMachine,
+};
 use anyhow::Result;
 use coldstore_common::config::MetadataConfig;
 use coldstore_proto::common;
 use coldstore_proto::metadata::metadata_service_server::MetadataService;
 use coldstore_proto::metadata::*;
-use prost_types::Timestamp;
-use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
-struct ObjectKey {
-    bucket: String,
-    key: String,
-    version_id: Option<String>,
-}
-
-impl ObjectKey {
-    fn new(bucket: String, key: String, version_id: Option<String>) -> Self {
-        Self {
-            bucket,
-            key,
-            version_id,
-        }
-    }
-}
-
-#[derive(Default)]
-struct MetadataState {
-    objects: HashMap<ObjectKey, common::ObjectMetadata>,
-    buckets: HashMap<String, common::BucketInfo>,
-    archive_bundles: HashMap<String, common::ArchiveBundle>,
-    archive_tasks: HashMap<String, common::ArchiveTask>,
-    recall_tasks: HashMap<String, common::RecallTask>,
-    tapes: HashMap<String, common::TapeInfo>,
-    scheduler_workers: HashMap<u64, common::SchedulerWorkerInfo>,
-    cache_workers: HashMap<u64, common::CacheWorkerInfo>,
-    tape_workers: HashMap<u64, common::TapeWorkerInfo>,
-}
-
 pub struct MetadataServiceImpl {
     config: MetadataConfig,
     state: Arc<RwLock<MetadataState>>,
+    snapshot_path: Option<PathBuf>,
+    #[cfg(feature = "metadata-raft")]
+    raft_backend: Option<Arc<crate::raft::RaftMetadataBackend>>,
 }
 
 impl MetadataServiceImpl {
@@ -49,7 +26,71 @@ impl MetadataServiceImpl {
         Ok(Self {
             config: config.clone(),
             state: Arc::new(RwLock::new(MetadataState::default())),
+            snapshot_path: None,
+            #[cfg(feature = "metadata-raft")]
+            raft_backend: None,
         })
+    }
+
+    pub async fn new_with_snapshot(
+        config: &MetadataConfig,
+        snapshot_path: PathBuf,
+    ) -> Result<Self> {
+        let state = if tokio::fs::try_exists(&snapshot_path).await? {
+            load_snapshot(&snapshot_path).await?
+        } else {
+            MetadataState::default()
+        };
+
+        Ok(Self {
+            config: config.clone(),
+            state: Arc::new(RwLock::new(state)),
+            snapshot_path: Some(snapshot_path),
+            #[cfg(feature = "metadata-raft")]
+            raft_backend: None,
+        })
+    }
+
+    #[cfg(feature = "metadata-raft")]
+    pub async fn new_with_raft_backend(
+        config: &MetadataConfig,
+        raft_backend: Arc<crate::raft::RaftMetadataBackend>,
+    ) -> Result<Self> {
+        Ok(Self {
+            config: config.clone(),
+            state: Arc::new(RwLock::new(MetadataState::default())),
+            snapshot_path: None,
+            raft_backend: Some(raft_backend),
+        })
+    }
+
+    async fn persist_locked(&self, state: &MetadataState) -> std::result::Result<(), Status> {
+        if let Some(path) = &self.snapshot_path {
+            save_snapshot(path, state)
+                .await
+                .map_err(|err| Status::internal(format!("persist metadata snapshot: {err}")))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply_and_persist(
+        &self,
+        command: MetadataCommand,
+    ) -> std::result::Result<(), Status> {
+        #[cfg(feature = "metadata-raft")]
+        if let Some(raft_backend) = &self.raft_backend {
+            raft_backend
+                .propose_local_apply(&self.state, command)
+                .await?;
+            let state = self.state.read().await;
+            return self.persist_locked(&state).await;
+        }
+
+        let mut state = self.state.write().await;
+        let mut state_machine = MetadataStateMachine::new(state.clone());
+        state_machine.apply(command)?;
+        *state = state_machine.into_state();
+        self.persist_locked(&state).await
     }
 
     fn metadata_nodes(&self) -> Vec<common::MetadataNodeInfo> {
@@ -81,28 +122,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::ObjectMetadata>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut object = request.into_inner();
-        let mut state = self.state.write().await;
-        if !state.buckets.contains_key(&object.bucket) {
-            return Err(Status::not_found(format!(
-                "bucket not found: {}",
-                object.bucket
-            )));
-        }
-
-        let now = now_timestamp();
-        if object.created_at.is_none() {
-            object.created_at = Some(now);
-        }
-        object.updated_at = Some(now);
-
-        let key = ObjectKey::new(
-            object.bucket.clone(),
-            object.key.clone(),
-            object.version_id.clone(),
-        );
-        state.objects.insert(key, object.clone());
-        refresh_bucket_stats(&mut state, &object.bucket);
+        self.apply_and_persist(MetadataCommand::PutObject(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -135,17 +156,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeleteObjectRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let removed = state.objects.remove(&ObjectKey::new(
-            request.bucket.clone(),
-            request.key.clone(),
-            None,
-        ));
-        if removed.is_none() {
-            return Err(Status::not_found("object not found"));
-        }
-        refresh_bucket_stats(&mut state, &request.bucket);
+        self.apply_and_persist(MetadataCommand::DeleteObject(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -212,11 +224,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateStorageClassRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let object = find_object_mut(&mut state, &request.bucket, &request.key, None)?;
-        object.storage_class = request.storage_class;
-        object.updated_at = Some(now_timestamp());
+        self.apply_and_persist(MetadataCommand::UpdateStorageClass(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -224,14 +233,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateArchiveLocationRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let object = find_object_mut(&mut state, &request.bucket, &request.key, None)?;
-        object.archive_id = Some(request.archive_id);
-        object.tape_id = Some(request.tape_id);
-        object.tape_set = request.tape_set;
-        object.tape_block_offset = Some(request.tape_block_offset);
-        object.updated_at = Some(now_timestamp());
+        self.apply_and_persist(MetadataCommand::UpdateArchiveLocation(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -239,13 +242,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateRestoreStatusRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let object = find_object_mut(&mut state, &request.bucket, &request.key, None)?;
-        validate_restore_transition(object.restore_status, request.status)?;
-        object.restore_status = Some(request.status);
-        object.restore_expire_at = request.expire_at;
-        object.updated_at = Some(now_timestamp());
+        self.apply_and_persist(MetadataCommand::UpdateRestoreStatus(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -276,18 +274,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::BucketInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut bucket = request.into_inner();
-        let mut state = self.state.write().await;
-        if state.buckets.contains_key(&bucket.name) {
-            return Err(Status::already_exists(format!(
-                "bucket already exists: {}",
-                bucket.name
-            )));
-        }
-        if bucket.created_at.is_none() {
-            bucket.created_at = Some(now_timestamp());
-        }
-        state.buckets.insert(bucket.name.clone(), bucket);
+        self.apply_and_persist(MetadataCommand::CreateBucket(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -309,19 +297,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeleteBucketRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let has_objects = state
-            .objects
-            .values()
-            .any(|object| object.bucket == request.name);
-        if has_objects {
-            return Err(Status::failed_precondition("bucket is not empty"));
-        }
-        state
-            .buckets
-            .remove(&request.name)
-            .ok_or_else(|| Status::not_found(format!("bucket not found: {}", request.name)))?;
+        self.apply_and_persist(MetadataCommand::DeleteBucket(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -339,12 +316,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::ArchiveBundle>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut bundle = request.into_inner();
-        if bundle.created_at.is_none() {
-            bundle.created_at = Some(now_timestamp());
-        }
-        let mut state = self.state.write().await;
-        state.archive_bundles.insert(bundle.id.clone(), bundle);
+        self.apply_and_persist(MetadataCommand::PutArchiveBundle(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -366,17 +339,10 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateArchiveBundleStatusRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        let bundle = state
-            .archive_bundles
-            .get_mut(&request.id)
-            .ok_or_else(|| Status::not_found("archive bundle not found"))?;
-        validate_archive_bundle_transition(bundle.status, request.status)?;
-        bundle.status = request.status;
-        if request.status == common::ArchiveBundleStatus::BundleCompleted as i32 {
-            bundle.completed_at = Some(now_timestamp());
-        }
+        self.apply_and_persist(MetadataCommand::UpdateArchiveBundleStatus(
+            request.into_inner(),
+        ))
+        .await?;
         Ok(Response::new(()))
     }
 
@@ -399,12 +365,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::ArchiveTask>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut task = request.into_inner();
-        if task.created_at.is_none() {
-            task.created_at = Some(now_timestamp());
-        }
-        let mut state = self.state.write().await;
-        state.archive_tasks.insert(task.id.clone(), task);
+        self.apply_and_persist(MetadataCommand::PutArchiveTask(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -426,14 +388,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::ArchiveTask>,
     ) -> std::result::Result<Response<()>, Status> {
-        let task = request.into_inner();
-        let mut state = self.state.write().await;
-        let current = state
-            .archive_tasks
-            .get(&task.id)
-            .ok_or_else(|| Status::not_found("archive task not found"))?;
-        validate_archive_task_transition(current.status, task.status)?;
-        state.archive_tasks.insert(task.id.clone(), task);
+        self.apply_and_persist(MetadataCommand::UpdateArchiveTask(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -461,12 +417,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::RecallTask>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut task = request.into_inner();
-        if task.created_at.is_none() {
-            task.created_at = Some(now_timestamp());
-        }
-        let mut state = self.state.write().await;
-        state.recall_tasks.insert(task.id.clone(), task);
+        self.apply_and_persist(MetadataCommand::PutRecallTask(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -488,14 +440,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::RecallTask>,
     ) -> std::result::Result<Response<()>, Status> {
-        let task = request.into_inner();
-        let mut state = self.state.write().await;
-        let current = state
-            .recall_tasks
-            .get(&task.id)
-            .ok_or_else(|| Status::not_found("recall task not found"))?;
-        validate_restore_transition(Some(current.status), task.status)?;
-        state.recall_tasks.insert(task.id.clone(), task);
+        self.apply_and_persist(MetadataCommand::UpdateRecallTask(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -550,12 +496,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::TapeInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut tape = request.into_inner();
-        if tape.registered_at.is_none() {
-            tape.registered_at = Some(now_timestamp());
-        }
-        let mut state = self.state.write().await;
-        state.tapes.insert(tape.id.clone(), tape);
+        self.apply_and_persist(MetadataCommand::PutTape(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -577,9 +519,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::TapeInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let tape = request.into_inner();
-        let mut state = self.state.write().await;
-        state.tapes.insert(tape.id.clone(), tape);
+        self.apply_and_persist(MetadataCommand::UpdateTape(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -628,10 +569,10 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::SchedulerWorkerInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut worker = request.into_inner();
-        worker.last_heartbeat = Some(now_timestamp());
-        let mut state = self.state.write().await;
-        state.scheduler_workers.insert(worker.node_id, worker);
+        self.apply_and_persist(MetadataCommand::RegisterSchedulerWorker(
+            request.into_inner(),
+        ))
+        .await?;
         Ok(Response::new(()))
     }
 
@@ -639,9 +580,10 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeregisterWorkerRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        state.scheduler_workers.remove(&request.node_id);
+        self.apply_and_persist(MetadataCommand::DeregisterSchedulerWorker(
+            request.into_inner(),
+        ))
+        .await?;
         Ok(Response::new(()))
     }
 
@@ -663,10 +605,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::CacheWorkerInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut worker = request.into_inner();
-        worker.last_heartbeat = Some(now_timestamp());
-        let mut state = self.state.write().await;
-        state.cache_workers.insert(worker.node_id, worker);
+        self.apply_and_persist(MetadataCommand::RegisterCacheWorker(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -674,9 +614,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeregisterWorkerRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        state.cache_workers.remove(&request.node_id);
+        self.apply_and_persist(MetadataCommand::DeregisterCacheWorker(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -698,10 +637,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<common::TapeWorkerInfo>,
     ) -> std::result::Result<Response<()>, Status> {
-        let mut worker = request.into_inner();
-        worker.last_heartbeat = Some(now_timestamp());
-        let mut state = self.state.write().await;
-        state.tape_workers.insert(worker.node_id, worker);
+        self.apply_and_persist(MetadataCommand::RegisterTapeWorker(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -709,9 +646,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<DeregisterWorkerRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        state.tape_workers.remove(&request.node_id);
+        self.apply_and_persist(MetadataCommand::DeregisterTapeWorker(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -733,24 +669,8 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<UpdateWorkerStatusRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let mut state = self.state.write().await;
-        match common::WorkerType::try_from(request.worker_type) {
-            Ok(common::WorkerType::WorkerScheduler) => state
-                .scheduler_workers
-                .get_mut(&request.node_id)
-                .map(|worker| worker.status = request.status),
-            Ok(common::WorkerType::WorkerCache) => state
-                .cache_workers
-                .get_mut(&request.node_id)
-                .map(|worker| worker.status = request.status),
-            Ok(common::WorkerType::WorkerTape) => state
-                .tape_workers
-                .get_mut(&request.node_id)
-                .map(|worker| worker.status = request.status),
-            _ => None,
-        }
-        .ok_or_else(|| Status::not_found("worker not found"))?;
+        self.apply_and_persist(MetadataCommand::UpdateWorkerStatus(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -772,279 +692,18 @@ impl MetadataService for MetadataServiceImpl {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> std::result::Result<Response<()>, Status> {
-        let request = request.into_inner();
-        let now = Some(now_timestamp());
-        let mut state = self.state.write().await;
-
-        match common::WorkerType::try_from(request.worker_type) {
-            Ok(common::WorkerType::WorkerScheduler) => {
-                let worker = state
-                    .scheduler_workers
-                    .get_mut(&request.node_id)
-                    .ok_or_else(|| Status::not_found("scheduler worker not found"))?;
-                worker.last_heartbeat = now;
-                if let Some(heartbeat_request::Payload::Scheduler(payload)) = request.payload {
-                    worker.pending_archive_tasks = payload.pending_archive_tasks;
-                    worker.pending_recall_tasks = payload.pending_recall_tasks;
-                    worker.active_jobs = payload.active_jobs;
-                }
-            }
-            Ok(common::WorkerType::WorkerCache) => {
-                let worker = state
-                    .cache_workers
-                    .get_mut(&request.node_id)
-                    .ok_or_else(|| Status::not_found("cache worker not found"))?;
-                worker.last_heartbeat = now;
-                if let Some(heartbeat_request::Payload::Cache(payload)) = request.payload {
-                    worker.used_capacity = payload.used_capacity;
-                    worker.blob_count = payload.blob_count;
-                }
-            }
-            Ok(common::WorkerType::WorkerTape) => {
-                let worker = state
-                    .tape_workers
-                    .get_mut(&request.node_id)
-                    .ok_or_else(|| Status::not_found("tape worker not found"))?;
-                worker.last_heartbeat = now;
-                if let Some(heartbeat_request::Payload::Tape(payload)) = request.payload {
-                    worker.drives = payload.drives;
-                }
-            }
-            _ => return Err(Status::invalid_argument("unknown worker type")),
-        }
-
+        self.apply_and_persist(MetadataCommand::Heartbeat(request.into_inner()))
+            .await?;
         Ok(Response::new(()))
     }
-}
-
-fn now_timestamp() -> Timestamp {
-    Timestamp {
-        seconds: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_secs() as i64,
-        nanos: 0,
-    }
-}
-
-fn refresh_bucket_stats(state: &mut MetadataState, bucket_name: &str) {
-    if let Some(bucket) = state.buckets.get_mut(bucket_name) {
-        let mut object_count = 0_u64;
-        let mut total_size = 0_u64;
-        for object in state
-            .objects
-            .values()
-            .filter(|object| object.bucket == bucket_name)
-        {
-            object_count += 1;
-            total_size += object.size;
-        }
-        bucket.object_count = object_count;
-        bucket.total_size = total_size;
-    }
-}
-
-#[allow(clippy::result_large_err)]
-fn find_object(
-    state: &MetadataState,
-    bucket: &str,
-    key: &str,
-    version_id: Option<&str>,
-) -> Result<common::ObjectMetadata, Status> {
-    if let Some(version_id) = version_id {
-        state
-            .objects
-            .get(&ObjectKey::new(
-                bucket.to_string(),
-                key.to_string(),
-                Some(version_id.to_string()),
-            ))
-            .cloned()
-            .ok_or_else(|| Status::not_found("object version not found"))
-    } else {
-        state
-            .objects
-            .iter()
-            .filter(|(candidate, _)| candidate.bucket == bucket && candidate.key == key)
-            .max_by(|(_, left), (_, right)| {
-                timestamp_sort_key(&left.updated_at).cmp(&timestamp_sort_key(&right.updated_at))
-            })
-            .map(|(_, object)| object.clone())
-            .ok_or_else(|| Status::not_found("object not found"))
-    }
-}
-
-#[allow(clippy::result_large_err)]
-fn find_object_mut<'a>(
-    state: &'a mut MetadataState,
-    bucket: &str,
-    key: &str,
-    version_id: Option<&str>,
-) -> Result<&'a mut common::ObjectMetadata, Status> {
-    if let Some(version_id) = version_id {
-        state
-            .objects
-            .get_mut(&ObjectKey::new(
-                bucket.to_string(),
-                key.to_string(),
-                Some(version_id.to_string()),
-            ))
-            .ok_or_else(|| Status::not_found("object version not found"))
-    } else {
-        let selected = state
-            .objects
-            .keys()
-            .filter(|candidate| candidate.bucket == bucket && candidate.key == key)
-            .max_by(|left, right| {
-                let left_ts = state
-                    .objects
-                    .get(*left)
-                    .map(|obj| timestamp_sort_key(&obj.updated_at))
-                    .unwrap_or_default();
-                let right_ts = state
-                    .objects
-                    .get(*right)
-                    .map(|obj| timestamp_sort_key(&obj.updated_at))
-                    .unwrap_or_default();
-                left_ts.cmp(&right_ts)
-            })
-            .cloned()
-            .ok_or_else(|| Status::not_found("object not found"))?;
-        state
-            .objects
-            .get_mut(&selected)
-            .ok_or_else(|| Status::not_found("object not found"))
-    }
-}
-
-fn timestamp_sort_key(ts: &Option<Timestamp>) -> (i64, i32) {
-    ts.as_ref()
-        .map(|ts| (ts.seconds, ts.nanos))
-        .unwrap_or_default()
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_restore_transition(current: Option<i32>, next: i32) -> Result<(), Status> {
-    let current = current.and_then(|value| common::RestoreStatus::try_from(value).ok());
-    let next = common::RestoreStatus::try_from(next)
-        .map_err(|_| Status::invalid_argument("invalid restore status"))?;
-    let valid = match current {
-        None => true,
-        Some(common::RestoreStatus::RestorePending) => matches!(
-            next,
-            common::RestoreStatus::RestoreInProgress
-                | common::RestoreStatus::RestoreWaitingForMedia
-                | common::RestoreStatus::RestoreFailed
-        ),
-        Some(common::RestoreStatus::RestoreWaitingForMedia) => matches!(
-            next,
-            common::RestoreStatus::RestorePending | common::RestoreStatus::RestoreFailed
-        ),
-        Some(common::RestoreStatus::RestoreInProgress) => {
-            matches!(
-                next,
-                common::RestoreStatus::RestoreCompleted | common::RestoreStatus::RestoreFailed
-            )
-        }
-        Some(common::RestoreStatus::RestoreCompleted) => {
-            matches!(next, common::RestoreStatus::RestoreExpired)
-        }
-        Some(common::RestoreStatus::RestoreExpired | common::RestoreStatus::RestoreFailed) => false,
-        Some(common::RestoreStatus::Unspecified) => true,
-    };
-
-    if valid {
-        Ok(())
-    } else {
-        Err(Status::failed_precondition(
-            "invalid restore state transition",
-        ))
-    }
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_archive_bundle_transition(current: i32, next: i32) -> Result<(), Status> {
-    let current = common::ArchiveBundleStatus::try_from(current)
-        .map_err(|_| Status::invalid_argument("invalid archive bundle status"))?;
-    let next = common::ArchiveBundleStatus::try_from(next)
-        .map_err(|_| Status::invalid_argument("invalid archive bundle status"))?;
-    let valid = match current {
-        common::ArchiveBundleStatus::BundlePending => {
-            matches!(next, common::ArchiveBundleStatus::BundleWriting)
-        }
-        common::ArchiveBundleStatus::BundleWriting => matches!(
-            next,
-            common::ArchiveBundleStatus::BundleCompleted
-                | common::ArchiveBundleStatus::BundleFailed
-        ),
-        common::ArchiveBundleStatus::BundleFailed => {
-            matches!(next, common::ArchiveBundleStatus::BundlePending)
-        }
-        common::ArchiveBundleStatus::BundleCompleted => false,
-        common::ArchiveBundleStatus::Unspecified => true,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(Status::failed_precondition(
-            "invalid archive bundle state transition",
-        ))
-    }
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_archive_task_transition(current: i32, next: i32) -> Result<(), Status> {
-    let current = common::ArchiveTaskStatus::try_from(current)
-        .map_err(|_| Status::invalid_argument("invalid archive task status"))?;
-    let next = common::ArchiveTaskStatus::try_from(next)
-        .map_err(|_| Status::invalid_argument("invalid archive task status"))?;
-    let valid = match current {
-        common::ArchiveTaskStatus::ArchiveTaskPending => {
-            matches!(next, common::ArchiveTaskStatus::ArchiveTaskInProgress)
-        }
-        common::ArchiveTaskStatus::ArchiveTaskInProgress => matches!(
-            next,
-            common::ArchiveTaskStatus::ArchiveTaskCompleted
-                | common::ArchiveTaskStatus::ArchiveTaskFailed
-        ),
-        common::ArchiveTaskStatus::ArchiveTaskFailed => {
-            matches!(next, common::ArchiveTaskStatus::ArchiveTaskPending)
-        }
-        common::ArchiveTaskStatus::ArchiveTaskCompleted => false,
-        common::ArchiveTaskStatus::Unspecified => true,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(Status::failed_precondition(
-            "invalid archive task state transition",
-        ))
-    }
-}
-
-fn is_pending_restore_status(status: i32) -> bool {
-    matches!(
-        common::RestoreStatus::try_from(status),
-        Ok(common::RestoreStatus::RestorePending)
-            | Ok(common::RestoreStatus::RestoreWaitingForMedia)
-            | Ok(common::RestoreStatus::RestoreInProgress)
-    )
-}
-
-fn is_active_restore_status(status: i32) -> bool {
-    matches!(
-        common::RestoreStatus::try_from(status),
-        Ok(common::RestoreStatus::RestorePending)
-            | Ok(common::RestoreStatus::RestoreWaitingForMedia)
-            | Ok(common::RestoreStatus::RestoreInProgress)
-            | Ok(common::RestoreStatus::RestoreCompleted)
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state_machine::apply_command;
     use coldstore_proto::common::{BucketInfo, ObjectMetadata};
+    use prost_types::Timestamp;
 
     fn test_bucket(name: &str) -> BucketInfo {
         BucketInfo {
@@ -1085,6 +744,43 @@ mod tests {
                 nanos: 0,
             }),
         }
+    }
+
+    #[test]
+    fn metadata_command_create_bucket_rejects_duplicate_names() {
+        let mut state = MetadataState::default();
+        apply_command(
+            &mut state,
+            MetadataCommand::CreateBucket(test_bucket("docs")),
+        )
+        .expect("first create succeeds");
+
+        let err = apply_command(
+            &mut state,
+            MetadataCommand::CreateBucket(test_bucket("docs")),
+        )
+        .expect_err("duplicate bucket should fail");
+
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert_eq!(state.bucket_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_command_does_not_clear_existing_state() {
+        let svc = MetadataServiceImpl::new(&MetadataConfig::default())
+            .await
+            .expect("service init");
+        svc.apply_and_persist(MetadataCommand::CreateBucket(test_bucket("docs")))
+            .await
+            .expect("first create succeeds");
+
+        let err = svc
+            .apply_and_persist(MetadataCommand::CreateBucket(test_bucket("docs")))
+            .await
+            .expect_err("duplicate bucket should fail");
+
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert!(svc.state.read().await.bucket("docs").is_some());
     }
 
     #[tokio::test]
@@ -1170,6 +866,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_snapshot_survives_service_restart() {
+        let snapshot_path = std::env::temp_dir().join(format!(
+            "coldstore-metadata-snapshot-{}.bin",
+            uuid::Uuid::new_v4()
+        ));
+
+        let svc = MetadataServiceImpl::new_with_snapshot(
+            &MetadataConfig::default(),
+            snapshot_path.clone(),
+        )
+        .await
+        .expect("persistent service init");
+        svc.create_bucket(Request::new(test_bucket("docs")))
+            .await
+            .expect("create bucket");
+        svc.put_object(Request::new(test_object("docs", "readme.txt")))
+            .await
+            .expect("put object");
+
+        let restarted = MetadataServiceImpl::new_with_snapshot(
+            &MetadataConfig::default(),
+            snapshot_path.clone(),
+        )
+        .await
+        .expect("persistent service restart");
+
+        let bucket = restarted
+            .get_bucket(Request::new(GetBucketRequest {
+                name: "docs".into(),
+            }))
+            .await
+            .expect("bucket should be loaded from snapshot")
+            .into_inner();
+        assert_eq!(bucket.object_count, 1);
+        assert_eq!(bucket.total_size, 5);
+
+        let object = restarted
+            .get_object(Request::new(GetObjectRequest {
+                bucket: "docs".into(),
+                key: "readme.txt".into(),
+            }))
+            .await
+            .expect("object should be loaded from snapshot")
+            .into_inner();
+        assert_eq!(object.checksum, "sum");
+
+        let _ = tokio::fs::remove_file(snapshot_path).await;
+    }
+
+    #[tokio::test]
     async fn worker_registration_and_heartbeat_update_cluster_state() {
         let svc = MetadataServiceImpl::new(&MetadataConfig::default())
             .await
@@ -1209,5 +955,31 @@ mod tests {
         assert_eq!(cluster.scheduler_workers[0].pending_archive_tasks, 3);
         assert_eq!(cluster.scheduler_workers[0].pending_recall_tasks, 2);
         assert_eq!(cluster.scheduler_workers[0].active_jobs, 1);
+    }
+
+    #[cfg(feature = "metadata-raft")]
+    #[tokio::test]
+    async fn metadata_service_raft_mode_routes_writes_through_propose_backend() {
+        let raft_backend = Arc::new(crate::raft::RaftMetadataBackend::new());
+        let svc = MetadataServiceImpl::new_with_raft_backend(
+            &MetadataConfig::default(),
+            raft_backend.clone(),
+        )
+        .await
+        .expect("raft-backed service init");
+
+        svc.create_bucket(Request::new(test_bucket("docs")))
+            .await
+            .expect("create bucket through propose backend");
+
+        assert_eq!(raft_backend.proposed_commands().await, 1);
+        let got = svc
+            .get_bucket(Request::new(GetBucketRequest {
+                name: "docs".into(),
+            }))
+            .await
+            .expect("bucket should be visible after proposed apply")
+            .into_inner();
+        assert_eq!(got.name, "docs");
     }
 }

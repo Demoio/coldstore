@@ -458,7 +458,7 @@ impl CacheService for CacheServiceImpl {
             .filter(|(key, _)| key.as_cursor() > after)
             .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect();
-        entries.sort_by(|(a, _), (b, _)| a.as_cursor().cmp(&b.as_cursor()));
+        entries.sort_by_key(|(key, _)| key.as_cursor());
 
         let has_more = entries.len() > limit;
         let response_entries = entries

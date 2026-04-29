@@ -1,4 +1,11 @@
+pub mod command;
 pub mod service;
+pub mod state_machine;
+
+#[cfg(feature = "metadata-raft")]
+pub mod raft;
+#[cfg(feature = "metadata-raft-rocksdb")]
+pub mod raft_storage;
 
 use anyhow::Result;
 use coldstore_common::config::MetadataConfig;
