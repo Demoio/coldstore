@@ -7,6 +7,19 @@
 
 磁带管理层提供磁带设备与磁带库的完整管理能力，通过自研 SDK 抽象层实现与底层硬件的解耦，前期对接 Linux SCSI 协议。
 
+### 1.0 当前实现状态（Phase-1 安全基线）
+
+当前代码已经包含一个不触碰宿主机设备的 Phase-1 磁带闭环：
+
+- `crates/vtl` 提供独立的虚拟磁带库 harness，覆盖 `lsscsi -g` 输出解析、`mtx`/`mt`/`sg3_utils`/`dd` 命令规格构造、runner 注入，以及纯内存 `VirtualTapeLibrary`。
+- `crates/tape` 的 `TapeServiceImpl` 通过 `TapeBackend` trait 依赖后端抽象，默认使用 `SimulatorTapeBackend`，不会访问 `/dev/st*`、`/dev/nst*`、`/dev/sg*` 或 `/dev/sch*`。
+- 已通过 gRPC service 层暴露可单测的驱动/带库操作：`ListDrives`、`GetDriveStatus`、`AcquireDrive`、`ReleaseDrive`、`LoadTape`、`UnloadTape`、`Rewind`、`SeekToFilemark`、`GetTapeMediaStatus`、`Inventory`。
+- 已通过 service/helper 和真实 gRPC client 路径暴露 filemark 分隔的 bundle 写入与按 filemark 读取；Scheduler 侧的 `TapeArchiveClient` 可通过 `TapeServiceClient.WriteBundle` 写入 simulator-backed TapeService。
+- `ReadBundle` 的 block offset 定位仍返回显式 `UNIMPLEMENTED`，等待真实 SCSI/磁带定位语义接入。
+- mhVTL 安装脚本位于 `scripts/setup-mhvtl-env.sh`，默认 dry-run；当前安全验证只执行 `bash -n`，不安装系统包、不启动内核模块或服务。
+
+真实 mhVTL/SCSI 闭环属于后续专用 VM/live 测试目标，必须显式使用 live runner 或安装脚本 `--execute`，不能作为默认单测路径。
+
 ### 1.1 完整职责
 
 | 功能域 | 说明 |
