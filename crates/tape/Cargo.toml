@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 coldstore-proto = { workspace = true }
 coldstore-common = { workspace = true }
+coldstore-vtl = { path = "../vtl" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }

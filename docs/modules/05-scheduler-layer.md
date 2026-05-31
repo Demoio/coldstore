@@ -7,6 +7,17 @@
 
 归档取回调度层负责冷数据的归档与取回调度，是 ColdStore 的核心业务逻辑层。设计需充分考虑**磁带的顺序读写特性**，通过聚合与合并策略最大化吞吐、减少换带与 seek。
 
+### 1.0 当前实现状态（Phase-1 安全基线）
+
+当前代码已经有一个可单测的安全归档批处理切片：
+
+- `MetadataBackedSchedulerBackend::archive_staging_batch(cache, tape, limit)` 通过注入的 `Phase1ArchiveCache` 和 `TapeArchiveWriter` 执行归档批处理，不直接访问宿主机设备。
+- `CacheArchiveClient` 已把真实 `CacheService` gRPC client 适配为 `Phase1ArchiveCache`；单测使用 in-process CacheService + 临时 HDD backend 验证 staging list/get/delete，而不是仅靠 fake cache。
+- `TapeArchiveClient` 已把真实 `TapeService` gRPC client 适配为 `TapeArchiveWriter`；单测使用 in-process TapeService + simulator backend 验证 `WriteBundle` filemark 写入与 `ReadBundle` 读回，而不是直接调用 service helper。
+- 该切片会读取 staging 数据、调用 tape writer 写入 bundle、写入 `ArchiveBundle`，再更新对象 `archive_id` / `tape_id` / `tape_set` / `tape_block_offset` 和 `StorageClass::Cold`，最后删除 staging 数据。
+- 单测使用 in-process `coldstore-tape` simulator writer / gRPC client 验证真实 filemark 写入与读回；没有启动 mhVTL、没有访问 `/dev/*`。
+- 当前一条 staging object 对应一个 Phase-1 bundle（`phase1-bundle:<bucket>/<key>`）；多对象聚合、驱动选择、失败补偿和 live tape worker client 仍是后续阶段。
+
 > **部署模型**：调度层运行在 **Scheduler Worker** 节点上，是 ColdStore 的**唯一业务中枢**。
 > Gateway 的全部 S3 请求都发往 Scheduler Worker 处理。
 > Scheduler 通过 gRPC 对接 Cache Worker（同机）和 Tape Worker（远程），

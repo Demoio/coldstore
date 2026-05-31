@@ -29,4 +29,6 @@ tokio-stream = { workspace = true }
 prost-types = { workspace = true }
 
 [dev-dependencies]
+coldstore-cache = { path = "../cache" }
 coldstore-metadata = { path = "../metadata" }
+coldstore-tape = { path = "../tape" }

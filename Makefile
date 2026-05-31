@@ -1,4 +1,4 @@
-.PHONY: build build-debug fmt fmt-check clippy test unit test-unit check check-all check-safe clean help install-hooks install-tools setup lint run-metadata run-gateway run-scheduler run-cache run-tape
+.PHONY: build build-debug fmt fmt-check clippy test unit test-unit vtl-unit vtl-check check check-all check-safe clean help install-hooks install-tools setup lint run-metadata run-gateway run-scheduler run-cache run-tape
 
 .DEFAULT_GOAL := help
 
@@ -21,11 +21,15 @@ test:
 	@cargo test --workspace --all-features
 unit test-unit:
 	@cargo test --workspace --lib --bins
+vtl-unit:
+	@cargo test -p coldstore-vtl --lib --tests
+vtl-check:
+	@cargo check -p coldstore-vtl
 check:
 	@cargo check --all-targets --all-features
 check-all: fmt-check clippy test
-check-safe: fmt-check clippy unit build-debug
-	@echo "Safe verification passed (fmt/clippy/unit/build only)."
+check-safe: fmt-check clippy unit vtl-unit build-debug
+	@echo "Safe verification passed (fmt/clippy/unit/vtl-unit/build only)."
 clean:
 	@cargo clean
 
@@ -59,6 +63,6 @@ help:
 	@echo "ColdStore Workspace Makefile"
 	@echo ""
 	@echo "Build:   build build-debug clean"
-	@echo "Quality: fmt fmt-check clippy test unit check check-all check-safe lint"
+	@echo "Quality: fmt fmt-check clippy test unit vtl-unit vtl-check check check-all check-safe lint"
 	@echo "Run:     run-metadata run-gateway run-scheduler run-cache run-tape"
 	@echo "Setup:   setup install-tools install-hooks"
