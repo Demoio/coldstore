@@ -11,6 +11,7 @@ use coldstore_proto::scheduler::{
     ListObjectsResponse, PutObjectMeta, PutObjectRequest, PutObjectResponse, RestoreObjectRequest,
     RestoreObjectResponse,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tonic::transport::Channel;
 use tracing::info;
@@ -66,18 +67,49 @@ pub trait GatewayBackend: Send + Sync + 'static {
 }
 
 pub struct GrpcGatewayBackend {
-    scheduler_addr: String,
+    scheduler_addrs: Vec<String>,
+    next_addr: Arc<AtomicUsize>,
 }
 
 impl GrpcGatewayBackend {
-    pub fn new(scheduler_addr: String) -> Self {
-        Self { scheduler_addr }
+    pub fn new(scheduler_addrs: Vec<String>) -> Self {
+        Self {
+            scheduler_addrs,
+            next_addr: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     async fn connect(&self) -> std::result::Result<SchedulerServiceClient<Channel>, tonic::Status> {
-        SchedulerServiceClient::connect(self.scheduler_addr.clone())
-            .await
-            .map_err(|err| tonic::Status::unavailable(err.to_string()))
+        if self.scheduler_addrs.is_empty() {
+            return Err(tonic::Status::unavailable(
+                "no scheduler addresses configured",
+            ));
+        }
+
+        let mut last_error: Option<tonic::Status> = None;
+        let base = self.next_addr.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.scheduler_addrs.len() {
+            let index = (base + offset) % self.scheduler_addrs.len();
+            let addr = normalize_scheduler_addr(&self.scheduler_addrs[index]);
+            match SchedulerServiceClient::connect(addr).await {
+                Ok(client) => return Ok(client),
+                Err(err) => {
+                    last_error = Some(tonic::Status::unavailable(err.to_string()));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            tonic::Status::unavailable("all scheduler addresses are unavailable")
+        }))
+    }
+}
+
+fn normalize_scheduler_addr(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
     }
 }
 
@@ -273,9 +305,24 @@ pub struct GatewayState {
 }
 
 pub async fn run(config: GatewayConfig) -> Result<()> {
-    let scheduler_addr = format!("http://{}", &config.scheduler_addrs[0]);
+    if config.scheduler_addrs.is_empty() {
+        anyhow::bail!("gateway requires at least one scheduler address");
+    }
+
+    let scheduler_addrs = config
+        .scheduler_addrs
+        .into_iter()
+        .map(|addr| normalize_scheduler_addr(&addr))
+        .collect::<Vec<_>>();
+
+    info!(
+        scheduler_count = scheduler_addrs.len(),
+        first_scheduler_addr = &scheduler_addrs[0],
+        "Gateway routing to scheduler fleet"
+    );
+
     let state = Arc::new(GatewayState {
-        backend: Arc::new(GrpcGatewayBackend::new(scheduler_addr)),
+        backend: Arc::new(GrpcGatewayBackend::new(scheduler_addrs)),
     });
 
     let app = handler::router(state);

@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod hdd;
 pub mod service;
+pub mod spdk;
 
 use anyhow::Result;
 use coldstore_common::config::CacheConfig;

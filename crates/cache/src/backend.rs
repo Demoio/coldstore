@@ -34,6 +34,8 @@ pub struct CacheXattrs {
     pub size: u64,
     pub expire_at: i64,
     pub cached_at: i64,
+    pub last_access_at: i64,
+    pub access_count: u64,
     pub checksum: Option<String>,
     pub content_type: Option<String>,
     pub etag: Option<String>,

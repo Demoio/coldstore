@@ -55,6 +55,18 @@ impl MetadataState {
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+            && self.buckets.is_empty()
+            && self.archive_bundles.is_empty()
+            && self.archive_tasks.is_empty()
+            && self.recall_tasks.is_empty()
+            && self.tapes.is_empty()
+            && self.scheduler_workers.is_empty()
+            && self.cache_workers.is_empty()
+            && self.tape_workers.is_empty()
+    }
 }
 
 #[derive(Default, Clone, Debug)]
@@ -139,6 +151,47 @@ pub(crate) fn apply_command(
             object.tape_block_offset = Some(request.tape_block_offset);
             object.updated_at = Some(now_timestamp());
         }
+        MetadataCommand::CompleteArchiveObject(mut request) => {
+            let bundle = request
+                .bundle
+                .take()
+                .ok_or_else(|| Status::invalid_argument("missing archive bundle"))?;
+            if bundle.id.is_empty() {
+                return Err(Status::invalid_argument("archive bundle id is empty"));
+            }
+            let object = find_object(
+                state,
+                &request.bucket,
+                &request.key,
+                request.version_id.as_deref(),
+            )?;
+            validate_complete_archive_preconditions(object, &request)?;
+
+            if let Some(existing) = state.archive_bundles.get(&bundle.id) {
+                if existing != &bundle {
+                    return Err(Status::already_exists(
+                        "archive bundle already exists with different payload",
+                    ));
+                }
+            } else {
+                state
+                    .archive_bundles
+                    .insert(bundle.id.clone(), bundle.clone());
+            }
+
+            let object = find_object_mut(
+                state,
+                &request.bucket,
+                &request.key,
+                request.version_id.as_deref(),
+            )?;
+            object.archive_id = Some(bundle.id);
+            object.tape_id = Some(bundle.tape_id);
+            object.tape_set = bundle.tape_set;
+            object.tape_block_offset = Some(request.tape_block_offset);
+            object.storage_class = request.storage_class;
+            object.updated_at = Some(now_timestamp());
+        }
         MetadataCommand::UpdateRestoreStatus(request) => {
             let object = find_object_mut(state, &request.bucket, &request.key, None)?;
             validate_restore_transition(object.restore_status, request.status)?;
@@ -192,7 +245,16 @@ pub(crate) fn apply_command(
             if task.created_at.is_none() {
                 task.created_at = Some(now_timestamp());
             }
-            state.archive_tasks.insert(task.id.clone(), task);
+            match state.archive_tasks.get(&task.id) {
+                Some(existing) if is_same_archive_task(existing, &task) => Ok(()),
+                Some(_) => Err(Status::already_exists(
+                    "archive task already exists with different payload",
+                )),
+                None => {
+                    state.archive_tasks.insert(task.id.clone(), task);
+                    Ok(())
+                }
+            }?;
         }
         MetadataCommand::UpdateArchiveTask(task) => {
             let current = state
@@ -206,7 +268,16 @@ pub(crate) fn apply_command(
             if task.created_at.is_none() {
                 task.created_at = Some(now_timestamp());
             }
-            state.recall_tasks.insert(task.id.clone(), task);
+            match state.recall_tasks.get(&task.id) {
+                Some(existing) if is_same_recall_task(existing, &task) => Ok(()),
+                Some(_) => Err(Status::already_exists(
+                    "recall task already exists with different payload",
+                )),
+                None => {
+                    state.recall_tasks.insert(task.id.clone(), task);
+                    Ok(())
+                }
+            }?;
         }
         MetadataCommand::UpdateRecallTask(task) => {
             let current = state
@@ -559,6 +630,55 @@ fn timestamp_sort_key(ts: &Option<Timestamp>) -> (i64, i32) {
 }
 
 #[allow(clippy::result_large_err)]
+fn validate_complete_archive_preconditions(
+    object: common::ObjectMetadata,
+    request: &CompleteArchiveObjectRequest,
+) -> Result<(), Status> {
+    if object.version_id != request.version_id {
+        return Err(Status::failed_precondition(
+            "object version changed before archive completion",
+        ));
+    }
+    let expected_size = request.expected_size.ok_or_else(|| {
+        Status::failed_precondition("archive completion requires expected_size precondition")
+    })?;
+    if object.size != expected_size {
+        return Err(Status::failed_precondition(
+            "object size changed before archive completion",
+        ));
+    }
+    let expected_checksum = request.expected_checksum.as_ref().ok_or_else(|| {
+        Status::failed_precondition("archive completion requires expected_checksum precondition")
+    })?;
+    if object.checksum != *expected_checksum {
+        return Err(Status::failed_precondition(
+            "object checksum changed before archive completion",
+        ));
+    }
+    let expected_storage_class = request.expected_storage_class.ok_or_else(|| {
+        Status::failed_precondition(
+            "archive completion requires expected_storage_class precondition",
+        )
+    })?;
+    if object.storage_class != expected_storage_class {
+        return Err(Status::failed_precondition(
+            "object storage class changed before archive completion",
+        ));
+    }
+    if request.expected_updated_at.is_none() {
+        return Err(Status::failed_precondition(
+            "archive completion requires expected_updated_at precondition",
+        ));
+    }
+    if object.updated_at != request.expected_updated_at {
+        return Err(Status::failed_precondition(
+            "object generation changed before archive completion",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
 fn validate_restore_transition(current: Option<i32>, next: i32) -> Result<(), Status> {
     let current = current.and_then(|value| common::RestoreStatus::try_from(value).ok());
     let next = common::RestoreStatus::try_from(next)
@@ -573,7 +693,9 @@ fn validate_restore_transition(current: Option<i32>, next: i32) -> Result<(), St
         ),
         Some(common::RestoreStatus::RestoreWaitingForMedia) => matches!(
             next,
-            common::RestoreStatus::RestorePending | common::RestoreStatus::RestoreFailed
+            common::RestoreStatus::RestoreInProgress
+                | common::RestoreStatus::RestorePending
+                | common::RestoreStatus::RestoreFailed
         ),
         Some(common::RestoreStatus::RestoreInProgress) => {
             matches!(
@@ -662,8 +784,38 @@ pub(crate) fn is_pending_restore_status(status: i32) -> bool {
         common::RestoreStatus::try_from(status),
         Ok(common::RestoreStatus::RestorePending)
             | Ok(common::RestoreStatus::RestoreWaitingForMedia)
-            | Ok(common::RestoreStatus::RestoreInProgress)
     )
+}
+
+fn is_same_archive_task(existing: &common::ArchiveTask, incoming: &common::ArchiveTask) -> bool {
+    existing.id == incoming.id
+        && existing.bundle_id == incoming.bundle_id
+        && existing.tape_id == incoming.tape_id
+        && existing.drive_id == incoming.drive_id
+        && existing.object_count == incoming.object_count
+        && existing.total_size == incoming.total_size
+        && existing.bytes_written == incoming.bytes_written
+        && existing.status == incoming.status
+        && existing.retry_count == incoming.retry_count
+        && existing.error == incoming.error
+}
+
+fn is_same_recall_task(existing: &common::RecallTask, incoming: &common::RecallTask) -> bool {
+    existing.id == incoming.id
+        && existing.bucket == incoming.bucket
+        && existing.key == incoming.key
+        && existing.version_id == incoming.version_id
+        && existing.archive_id == incoming.archive_id
+        && existing.tape_id == incoming.tape_id
+        && existing.tape_set == incoming.tape_set
+        && existing.tape_block_offset == incoming.tape_block_offset
+        && existing.object_size == incoming.object_size
+        && existing.checksum == incoming.checksum
+        && existing.tier == incoming.tier
+        && existing.days == incoming.days
+        && existing.status == incoming.status
+        && existing.drive_id == incoming.drive_id
+        && existing.retry_count == incoming.retry_count
 }
 
 pub(crate) fn is_active_restore_status(status: i32) -> bool {
@@ -679,6 +831,52 @@ pub(crate) fn is_active_restore_status(status: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn archive_task(id: &str) -> common::ArchiveTask {
+        common::ArchiveTask {
+            id: id.into(),
+            bundle_id: "bundle-1".into(),
+            tape_id: "TAPE-1".into(),
+            drive_id: Some("drive-0".into()),
+            object_count: 1,
+            total_size: 1024,
+            bytes_written: 0,
+            status: common::ArchiveTaskStatus::ArchiveTaskPending as i32,
+            retry_count: 0,
+            created_at: None,
+            started_at: None,
+            completed_at: None,
+            error: None,
+        }
+    }
+
+    fn recall_task(id: &str, days: u32) -> common::RecallTask {
+        common::RecallTask {
+            id: id.into(),
+            bucket: "docs".into(),
+            key: "readme.txt".into(),
+            version_id: None,
+            archive_id: "bundle-1".into(),
+            tape_id: "TAPE-1".into(),
+            tape_set: vec!["TAPE-1".into()],
+            tape_block_offset: 0,
+            object_size: 1024,
+            checksum: "sha256".into(),
+            tier: common::RestoreTier::Standard as i32,
+            days,
+            expire_at: Some(Timestamp {
+                seconds: 1000,
+                nanos: 0,
+            }),
+            status: common::RestoreStatus::RestorePending as i32,
+            drive_id: None,
+            retry_count: 0,
+            created_at: None,
+            started_at: None,
+            completed_at: None,
+            error: None,
+        }
+    }
 
     #[test]
     fn decode_snapshot_rejects_excessive_section_count_before_allocating() {
@@ -702,5 +900,88 @@ mod tests {
         assert!(err
             .to_string()
             .contains("metadata snapshot message is too large"));
+    }
+
+    #[test]
+    fn put_archive_task_is_idempotent_for_identical_payload() {
+        let mut state = MetadataState::default();
+        apply_command(
+            &mut state,
+            MetadataCommand::PutArchiveTask(archive_task("archive-task-1")),
+        )
+        .expect("first archive task insert");
+
+        apply_command(
+            &mut state,
+            MetadataCommand::PutArchiveTask(archive_task("archive-task-1")),
+        )
+        .expect("second identical insert should be idempotent");
+
+        assert_eq!(state.archive_tasks.len(), 1);
+    }
+
+    #[test]
+    fn put_archive_task_requires_same_payload_for_idempotent_write() {
+        let mut state = MetadataState::default();
+        apply_command(
+            &mut state,
+            MetadataCommand::PutArchiveTask(archive_task("archive-task-2")),
+        )
+        .expect("first archive task insert");
+
+        let mut changed = archive_task("archive-task-2");
+        changed.tape_id = "TAPE-2".into();
+
+        let err = apply_command(&mut state, MetadataCommand::PutArchiveTask(changed))
+            .expect_err("different payload should be rejected");
+
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert_eq!(state.archive_tasks.len(), 1);
+    }
+
+    #[test]
+    fn put_recall_task_is_idempotent_for_identical_payload() {
+        let mut state = MetadataState::default();
+        apply_command(
+            &mut state,
+            MetadataCommand::PutRecallTask(recall_task("recall-task-1", 1)),
+        )
+        .expect("first recall task insert");
+
+        apply_command(
+            &mut state,
+            MetadataCommand::PutRecallTask(recall_task("recall-task-1", 1)),
+        )
+        .expect("second identical insert should be idempotent");
+
+        assert_eq!(state.recall_tasks.len(), 1);
+    }
+
+    #[test]
+    fn put_recall_task_requires_same_payload_for_idempotent_write() {
+        let mut state = MetadataState::default();
+        apply_command(
+            &mut state,
+            MetadataCommand::PutRecallTask(recall_task("recall-task-2", 1)),
+        )
+        .expect("first recall task insert");
+
+        let mut changed = recall_task("recall-task-2", 2);
+        changed.checksum = "different-checksum".into();
+
+        let err = apply_command(&mut state, MetadataCommand::PutRecallTask(changed))
+            .expect_err("different payload should be rejected");
+
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert_eq!(state.recall_tasks.len(), 1);
+    }
+
+    #[test]
+    fn restore_waiting_for_media_can_transition_to_in_progress() {
+        assert!(validate_restore_transition(
+            Some(common::RestoreStatus::RestoreWaitingForMedia as i32),
+            common::RestoreStatus::RestoreInProgress as i32,
+        )
+        .is_ok());
     }
 }

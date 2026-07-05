@@ -1,4 +1,4 @@
-.PHONY: build build-debug fmt fmt-check clippy test unit test-unit vtl-unit vtl-check check check-all check-safe clean help install-hooks install-tools setup lint run-metadata run-gateway run-scheduler run-cache run-tape
+.PHONY: build build-debug fmt fmt-check clippy test unit test-unit vtl-unit vtl-check check check-all check-safe clean help install-hooks install-tools setup lint run-metadata run-gateway run-scheduler run-cache run-tape run-node run-node-no-tape
 
 .DEFAULT_GOAL := help
 
@@ -43,6 +43,10 @@ run-cache:
 	@cargo run -p coldstore-cache
 run-tape:
 	@cargo run -p coldstore-tape
+run-node:
+	@cargo run -p coldstore-node
+run-node-no-tape:
+	@cargo run -p coldstore-node -- --config configs/single-node-no-tape.yaml
 
 lint: fmt-check clippy check unit
 	@echo "All lint checks passed (unit-only)."
@@ -64,5 +68,5 @@ help:
 	@echo ""
 	@echo "Build:   build build-debug clean"
 	@echo "Quality: fmt fmt-check clippy test unit vtl-unit vtl-check check check-all check-safe lint"
-	@echo "Run:     run-metadata run-gateway run-scheduler run-cache run-tape"
+	@echo "Run:     run-node run-node-no-tape run-metadata run-gateway run-scheduler run-cache run-tape"
 	@echo "Setup:   setup install-tools install-hooks"

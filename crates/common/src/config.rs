@@ -29,7 +29,19 @@ pub struct MetadataConfig {
     pub listen: String,
     pub cluster: String,
     pub data_path: String,
+    #[serde(default = "default_metadata_consensus_mode")]
+    pub consensus_mode: MetadataConsensusMode,
+    #[serde(default)]
+    pub raft_state_path: Option<String>,
     pub rocksdb: RocksDbConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataConsensusMode {
+    Standalone,
+    LocalRaft,
+    PersistentRaft,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,8 +56,10 @@ impl Default for MetadataConfig {
         Self {
             node_id: 1,
             listen: "0.0.0.0:21001".to_string(),
-            cluster: "1:127.0.0.1:21001,2:127.0.0.1:21002,3:127.0.0.1:21003".to_string(),
+            cluster: "1:127.0.0.1:21001".to_string(),
             data_path: "/var/lib/coldstore/metadata".to_string(),
+            consensus_mode: default_metadata_consensus_mode(),
+            raft_state_path: None,
             rocksdb: RocksDbConfig {
                 max_open_files: 1024,
                 write_buffer_size_mb: 64,
@@ -55,22 +69,42 @@ impl Default for MetadataConfig {
     }
 }
 
+fn default_metadata_consensus_mode() -> MetadataConsensusMode {
+    MetadataConsensusMode::PersistentRaft
+}
+
 // ---------------------------------------------------------------------------
 //  Scheduler Worker 配置
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
+    #[serde(default = "default_scheduler_node_id")]
+    pub node_id: u64,
     pub listen: String,
     pub metadata_addrs: Vec<String>,
+    #[serde(default = "default_cache_addrs")]
+    pub cache_addrs: Vec<String>,
+    #[serde(default = "default_tape_addrs")]
+    pub tape_addrs: Vec<String>,
     pub archive: ArchiveSchedulerConfig,
     pub recall: RecallSchedulerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveSchedulerConfig {
+    #[serde(default = "default_scheduler_enabled")]
+    pub enabled: bool,
     pub scan_interval_secs: u64,
     pub batch_size: usize,
+    #[serde(default = "default_scheduler_worker_count")]
+    pub max_workers: usize,
+    #[serde(default = "default_scheduler_drive_id")]
+    pub drive_id: String,
+    #[serde(default = "default_scheduler_tape_id")]
+    pub tape_id: String,
+    #[serde(default = "default_scheduler_tape_set")]
+    pub tape_set: Vec<String>,
     pub min_archive_size_mb: u64,
     pub max_archive_size_mb: u64,
     pub target_throughput_mbps: u64,
@@ -81,24 +115,36 @@ pub struct ArchiveSchedulerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallSchedulerConfig {
+    #[serde(default = "default_scheduler_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_recall_scan_interval_secs")]
+    pub scan_interval_secs: u64,
     pub max_concurrent_restores: usize,
+    #[serde(default = "default_scheduler_worker_count")]
+    pub max_workers: usize,
     pub merge_window_secs: u64,
     pub restore_timeout_secs: u64,
     pub read_buffer_mb: u64,
+    #[serde(default = "default_scheduler_drive_id")]
+    pub drive_id: String,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
+            node_id: 1,
             listen: "0.0.0.0:22001".to_string(),
-            metadata_addrs: vec![
-                "127.0.0.1:21001".to_string(),
-                "127.0.0.1:21002".to_string(),
-                "127.0.0.1:21003".to_string(),
-            ],
+            metadata_addrs: vec!["127.0.0.1:21001".to_string()],
+            cache_addrs: default_cache_addrs(),
+            tape_addrs: default_tape_addrs(),
             archive: ArchiveSchedulerConfig {
+                enabled: true,
                 scan_interval_secs: 60,
                 batch_size: 1000,
+                max_workers: 1,
+                drive_id: default_scheduler_drive_id(),
+                tape_id: default_scheduler_tape_id(),
+                tape_set: default_scheduler_tape_set(),
                 min_archive_size_mb: 100,
                 max_archive_size_mb: 10240,
                 target_throughput_mbps: 300,
@@ -107,13 +153,53 @@ impl Default for SchedulerConfig {
                 block_size: 262144,
             },
             recall: RecallSchedulerConfig {
+                enabled: true,
+                scan_interval_secs: default_recall_scan_interval_secs(),
                 max_concurrent_restores: 10,
+                max_workers: 1,
                 merge_window_secs: 60,
                 restore_timeout_secs: 3600,
                 read_buffer_mb: 64,
+                drive_id: default_scheduler_drive_id(),
             },
         }
     }
+}
+
+fn default_cache_addrs() -> Vec<String> {
+    vec!["127.0.0.1:23001".to_string()]
+}
+
+fn default_tape_addrs() -> Vec<String> {
+    vec!["127.0.0.1:24001".to_string()]
+}
+
+fn default_scheduler_enabled() -> bool {
+    true
+}
+
+fn default_recall_scan_interval_secs() -> u64 {
+    60
+}
+
+fn default_scheduler_drive_id() -> String {
+    "drive-0".to_string()
+}
+
+fn default_scheduler_tape_id() -> String {
+    "TAPE0001".to_string()
+}
+
+fn default_scheduler_tape_set() -> Vec<String> {
+    vec![default_scheduler_tape_id()]
+}
+
+fn default_scheduler_node_id() -> u64 {
+    1
+}
+
+fn default_scheduler_worker_count() -> usize {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +215,8 @@ pub struct CacheConfig {
     pub eviction_policy: String,
     pub eviction_batch_size: usize,
     pub eviction_low_watermark: f64,
+    pub staging_capacity_ratio: f64,
+    pub restored_capacity_ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,11 +237,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:23001".to_string(),
-            metadata_addrs: vec![
-                "127.0.0.1:21001".to_string(),
-                "127.0.0.1:21002".to_string(),
-                "127.0.0.1:21003".to_string(),
-            ],
+            metadata_addrs: vec!["127.0.0.1:21001".to_string()],
             backend: CacheBackendConfig::Hdd {
                 path: "/var/lib/coldstore/cache".to_string(),
                 max_size_gb: 100,
@@ -162,6 +246,8 @@ impl Default for CacheConfig {
             eviction_policy: "Lru".to_string(),
             eviction_batch_size: 64,
             eviction_low_watermark: 0.8,
+            staging_capacity_ratio: 0.35,
+            restored_capacity_ratio: 0.65,
         }
     }
 }
@@ -176,6 +262,8 @@ pub struct TapeConfig {
     pub metadata_addrs: Vec<String>,
     pub sdk_backend: String,
     pub scsi: ScsiConfig,
+    #[serde(default)]
+    pub simulator: TapeSimulatorConfig,
     pub library_device: Option<String>,
     pub supported_formats: Vec<String>,
     pub tape_hold_secs: u64,
@@ -189,25 +277,86 @@ pub struct ScsiConfig {
     pub buffer_size_mb: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TapeSimulatorConfig {
+    #[serde(default = "default_simulator_slot_count")]
+    pub slot_count: u32,
+    #[serde(default = "default_simulator_tape_ids")]
+    pub tape_ids: Vec<String>,
+    #[serde(default = "default_simulator_autoload_tape_id")]
+    pub autoload_tape_id: Option<String>,
+}
+
+impl Default for TapeSimulatorConfig {
+    fn default() -> Self {
+        Self {
+            slot_count: default_simulator_slot_count(),
+            tape_ids: default_simulator_tape_ids(),
+            autoload_tape_id: default_simulator_autoload_tape_id(),
+        }
+    }
+}
+
 impl Default for TapeConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:24001".to_string(),
-            metadata_addrs: vec![
-                "127.0.0.1:21001".to_string(),
-                "127.0.0.1:21002".to_string(),
-                "127.0.0.1:21003".to_string(),
-            ],
-            sdk_backend: "scsi".to_string(),
+            metadata_addrs: vec!["127.0.0.1:21001".to_string()],
+            sdk_backend: "simulator".to_string(),
             scsi: ScsiConfig {
                 devices: vec!["/dev/nst0".to_string()],
                 block_size: 262144,
                 buffer_size_mb: 64,
             },
+            simulator: TapeSimulatorConfig::default(),
             library_device: None,
             supported_formats: vec!["LTO-9".to_string(), "LTO-10".to_string()],
             tape_hold_secs: 300,
             drive_acquire_timeout_secs: 600,
         }
+    }
+}
+
+fn default_simulator_slot_count() -> u32 {
+    8
+}
+
+fn default_simulator_tape_ids() -> Vec<String> {
+    vec![default_scheduler_tape_id()]
+}
+
+fn default_simulator_autoload_tape_id() -> Option<String> {
+    Some(default_scheduler_tape_id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_default_consensus_mode_is_persistent_raft() {
+        assert!(matches!(
+            MetadataConfig::default().consensus_mode,
+            MetadataConsensusMode::PersistentRaft
+        ));
+    }
+
+    #[test]
+    fn metadata_default_config_is_single_node_persistent_raft() {
+        let config = MetadataConfig::default();
+        assert_eq!(config.node_id, 1);
+        assert_eq!(config.cluster, "1:127.0.0.1:21001");
+        assert!(matches!(
+            config.consensus_mode,
+            MetadataConsensusMode::PersistentRaft
+        ));
+    }
+
+    #[test]
+    fn worker_defaults_use_single_metadata_endpoint() {
+        let expected = vec!["127.0.0.1:21001".to_string()];
+        assert_eq!(SchedulerConfig::default().metadata_addrs, expected);
+        assert_eq!(CacheConfig::default().metadata_addrs, expected);
+        assert_eq!(TapeConfig::default().metadata_addrs, expected);
     }
 }

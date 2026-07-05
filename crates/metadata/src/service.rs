@@ -1,7 +1,7 @@
 use crate::command::MetadataCommand;
 use crate::state_machine::{
     find_object, is_active_restore_status, is_pending_restore_status, load_snapshot, now_timestamp,
-    save_snapshot, MetadataState, MetadataStateMachine,
+    save_snapshot, MetadataState,
 };
 use anyhow::Result;
 use coldstore_common::config::MetadataConfig;
@@ -10,15 +10,15 @@ use coldstore_proto::metadata::metadata_service_server::MetadataService;
 use coldstore_proto::metadata::*;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tonic::{Request, Response, Status};
 
 pub struct MetadataServiceImpl {
     config: MetadataConfig,
     state: Arc<RwLock<MetadataState>>,
     snapshot_path: Option<PathBuf>,
-    #[cfg(feature = "metadata-raft")]
     raft_backend: Option<Arc<crate::raft::RaftMetadataBackend>>,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl MetadataServiceImpl {
@@ -27,8 +27,8 @@ impl MetadataServiceImpl {
             config: config.clone(),
             state: Arc::new(RwLock::new(MetadataState::default())),
             snapshot_path: None,
-            #[cfg(feature = "metadata-raft")]
-            raft_backend: None,
+            raft_backend: Some(std::sync::Arc::new(crate::raft::RaftMetadataBackend::new())),
+            write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -46,21 +46,56 @@ impl MetadataServiceImpl {
             config: config.clone(),
             state: Arc::new(RwLock::new(state)),
             snapshot_path: Some(snapshot_path),
-            #[cfg(feature = "metadata-raft")]
-            raft_backend: None,
+            raft_backend: Some(std::sync::Arc::new(crate::raft::RaftMetadataBackend::new())),
+            write_lock: Arc::new(Mutex::new(())),
         })
     }
 
-    #[cfg(feature = "metadata-raft")]
     pub async fn new_with_raft_backend(
         config: &MetadataConfig,
         raft_backend: Arc<crate::raft::RaftMetadataBackend>,
     ) -> Result<Self> {
+        let state = raft_backend.bootstrapped_state().await?.unwrap_or_default();
         Ok(Self {
             config: config.clone(),
-            state: Arc::new(RwLock::new(MetadataState::default())),
+            state: Arc::new(RwLock::new(state)),
             snapshot_path: None,
             raft_backend: Some(raft_backend),
+            write_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    pub async fn new_with_snapshot_and_raft_backend(
+        config: &MetadataConfig,
+        snapshot_path: PathBuf,
+        raft_backend: Arc<crate::raft::RaftMetadataBackend>,
+    ) -> Result<Self> {
+        let raft_state = raft_backend.bootstrapped_state().await?.unwrap_or_default();
+        let state = if raft_state.is_empty() {
+            match tokio::fs::try_exists(&snapshot_path).await? {
+                true => {
+                    let snapshot_state = load_snapshot(&snapshot_path).await?;
+                    if snapshot_state.is_empty() {
+                        MetadataState::default()
+                    } else {
+                        raft_backend
+                            .bootstrap_state_if_empty(&snapshot_state)
+                            .await?;
+                        snapshot_state
+                    }
+                }
+                false => MetadataState::default(),
+            }
+        } else {
+            raft_state
+        };
+
+        Ok(Self {
+            config: config.clone(),
+            state: Arc::new(RwLock::new(state)),
+            snapshot_path: Some(snapshot_path),
+            raft_backend: Some(raft_backend),
+            write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -77,23 +112,19 @@ impl MetadataServiceImpl {
         &self,
         command: MetadataCommand,
     ) -> std::result::Result<(), Status> {
-        #[cfg(feature = "metadata-raft")]
-        if let Some(raft_backend) = &self.raft_backend {
-            raft_backend
-                .propose_local_apply(&self.state, command)
-                .await?;
-            let state = self.state.read().await;
-            return self.persist_locked(&state).await;
-        }
-
-        let mut state = self.state.write().await;
-        let mut state_machine = MetadataStateMachine::new(state.clone());
-        state_machine.apply(command)?;
-        *state = state_machine.into_state();
+        let _write_guard = self.write_lock.lock().await;
+        let raft_backend = self
+            .raft_backend
+            .as_ref()
+            .ok_or_else(|| Status::internal("metadata raft backend is not initialized"))?;
+        raft_backend
+            .propose_local_apply(&self.state, command)
+            .await?;
+        let state = self.state.read().await;
         self.persist_locked(&state).await
     }
 
-    fn metadata_nodes(&self) -> Vec<common::MetadataNodeInfo> {
+    fn metadata_nodes(&self, leader_hint: Option<u64>) -> Vec<common::MetadataNodeInfo> {
         self.config
             .cluster
             .split(',')
@@ -103,8 +134,8 @@ impl MetadataServiceImpl {
                 Some(common::MetadataNodeInfo {
                     node_id,
                     addr: addr.to_string(),
-                    raft_role: if node_id == self.config.node_id {
-                        "LeaderCandidate".into()
+                    raft_role: if Some(node_id) == leader_hint {
+                        "Leader".into()
                     } else {
                         "Follower".into()
                     },
@@ -234,6 +265,15 @@ impl MetadataService for MetadataServiceImpl {
         request: Request<UpdateArchiveLocationRequest>,
     ) -> std::result::Result<Response<()>, Status> {
         self.apply_and_persist(MetadataCommand::UpdateArchiveLocation(request.into_inner()))
+            .await?;
+        Ok(Response::new(()))
+    }
+
+    async fn complete_archive_object(
+        &self,
+        request: Request<CompleteArchiveObjectRequest>,
+    ) -> std::result::Result<Response<()>, Status> {
+        self.apply_and_persist(MetadataCommand::CompleteArchiveObject(request.into_inner()))
             .await?;
         Ok(Response::new(()))
     }
@@ -553,15 +593,27 @@ impl MetadataService for MetadataServiceImpl {
         _request: Request<()>,
     ) -> std::result::Result<Response<common::ClusterInfo>, Status> {
         let state = self.state.read().await;
+        #[cfg(feature = "metadata-raft")]
+        let (leader_id, term, committed_index) = if let Some(backend) = &self.raft_backend {
+            let (term, leader_id) = backend.cluster_term_and_leader().await;
+            (leader_id, term, backend.proposed_commands().await)
+        } else {
+            (None, 1, state.objects.len() as u64)
+        };
+
+        #[cfg(not(feature = "metadata-raft"))]
+        let (leader_id, term, committed_index) = (None, 0_u64, state.objects.len() as u64);
+
+        let metadata_nodes = self.metadata_nodes(leader_id);
         Ok(Response::new(common::ClusterInfo {
             cluster_id: "coldstore-phase1".into(),
-            metadata_nodes: self.metadata_nodes(),
+            metadata_nodes,
             scheduler_workers: state.scheduler_workers.values().cloned().collect(),
             cache_workers: state.cache_workers.values().cloned().collect(),
             tape_workers: state.tape_workers.values().cloned().collect(),
-            leader_id: Some(self.config.node_id),
-            term: 1,
-            committed_index: state.objects.len() as u64,
+            leader_id,
+            term,
+            committed_index,
         }))
     }
 
@@ -863,6 +915,103 @@ mod tests {
             .into_inner();
         assert_eq!(bucket.object_count, 1);
         assert_eq!(bucket.total_size, 5);
+    }
+
+    #[tokio::test]
+    async fn complete_archive_object_is_atomic_and_checks_generation() {
+        let svc = MetadataServiceImpl::new(&MetadataConfig::default())
+            .await
+            .expect("service init");
+        svc.create_bucket(Request::new(test_bucket("docs")))
+            .await
+            .expect("create bucket");
+        svc.put_object(Request::new(test_object("docs", "readme.txt")))
+            .await
+            .expect("put object");
+
+        let before = svc
+            .head_object(Request::new(HeadObjectRequest {
+                bucket: "docs".into(),
+                key: "readme.txt".into(),
+            }))
+            .await
+            .expect("head object")
+            .into_inner();
+        let mut stale_updated_at = before.updated_at;
+        if let Some(ts) = stale_updated_at.as_mut() {
+            ts.seconds = ts.seconds.saturating_sub(1);
+        }
+
+        let bundle = common::ArchiveBundle {
+            id: "bundle-1".into(),
+            tape_id: "TAPE0001".into(),
+            tape_set: vec!["TAPE0001".into()],
+            entries: vec![common::BundleEntry {
+                bucket: "docs".into(),
+                key: "readme.txt".into(),
+                version_id: None,
+                size: before.size,
+                offset_in_bundle: 0,
+                tape_block_offset: 7,
+                checksum: before.checksum.clone(),
+            }],
+            total_size: before.size,
+            filemark_start: 7,
+            filemark_end: 8,
+            checksum: Some(before.checksum.clone()),
+            status: common::ArchiveBundleStatus::BundleCompleted as i32,
+            created_at: before.updated_at,
+            completed_at: before.updated_at,
+        };
+
+        let err = svc
+            .complete_archive_object(Request::new(CompleteArchiveObjectRequest {
+                bucket: "docs".into(),
+                key: "readme.txt".into(),
+                version_id: before.version_id.clone(),
+                expected_size: Some(before.size),
+                expected_checksum: Some(before.checksum.clone()),
+                expected_storage_class: Some(before.storage_class),
+                expected_updated_at: stale_updated_at,
+                bundle: Some(bundle.clone()),
+                tape_block_offset: 7,
+                storage_class: common::StorageClass::Cold as i32,
+            }))
+            .await
+            .expect_err("stale generation must reject archive completion");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(svc
+            .get_archive_bundle(Request::new(GetArchiveBundleRequest {
+                id: bundle.id.clone(),
+            }))
+            .await
+            .is_err());
+
+        svc.complete_archive_object(Request::new(CompleteArchiveObjectRequest {
+            bucket: "docs".into(),
+            key: "readme.txt".into(),
+            version_id: before.version_id.clone(),
+            expected_size: Some(before.size),
+            expected_checksum: Some(before.checksum.clone()),
+            expected_storage_class: Some(before.storage_class),
+            expected_updated_at: before.updated_at,
+            bundle: Some(bundle.clone()),
+            tape_block_offset: 7,
+            storage_class: common::StorageClass::Cold as i32,
+        }))
+        .await
+        .expect("archive completion should succeed");
+
+        let archived = svc
+            .head_object(Request::new(HeadObjectRequest {
+                bucket: "docs".into(),
+                key: "readme.txt".into(),
+            }))
+            .await
+            .expect("head archived object")
+            .into_inner();
+        assert_eq!(archived.storage_class, common::StorageClass::Cold as i32);
+        assert_eq!(archived.archive_id.as_deref(), Some("bundle-1"));
     }
 
     #[tokio::test]

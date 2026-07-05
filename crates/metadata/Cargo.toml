@@ -10,7 +10,7 @@ name = "coldstore-metadata"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["metadata-raft-rocksdb"]
 metadata-raft = ["dep:openraft"]
 metadata-raft-rocksdb = ["metadata-raft", "dep:rocksdb"]
 
@@ -30,8 +30,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 config = { workspace = true }
 
-# Phase 2A starts with opt-in local binary snapshot persistence in service.rs.
-# Phase 2B keeps OpenRaft + RocksDB behind the `metadata-raft` feature until the
-# command/state-machine boundary is stable enough to become the default backend.
+# Default metadata execution path is now persistent Raft-local mode.
+# Disable default features only when explicitly embedding with a custom runtime.
 openraft = { version = "0.10.0-alpha.18", optional = true }
 rocksdb = { version = "0.24", default-features = false, optional = true }
