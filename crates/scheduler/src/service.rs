@@ -1,17 +1,25 @@
 use crate::SchedulerState;
 use coldstore_proto::cache::cache_service_client::CacheServiceClient;
+use coldstore_proto::cache::get_response::Payload as CacheGetPayload;
 use coldstore_proto::cache::get_staging_response::Payload as GetStagingPayload;
+use coldstore_proto::cache::put_restored_request::Payload as PutRestoredPayload;
+use coldstore_proto::cache::put_staging_request::Payload as PutStagingPayload;
 use coldstore_proto::cache::{
-    DeleteStagingRequest, GetStagingRequest, ListStagingKeysRequest, StagingKeyEntry,
+    DeleteStagingRequest, GetRequest as CacheGetRequest, GetStagingRequest, ListStagingKeysRequest,
+    PutRestoredMeta, PutRestoredRequest, PutStagingMeta, PutStagingRequest, StagingKeyEntry,
     StagingObjectMeta,
 };
 use coldstore_proto::common;
 use coldstore_proto::scheduler::scheduler_service_server::SchedulerService;
 use coldstore_proto::scheduler::*;
+use coldstore_proto::tape::read_bundle_request::Location as TapeReadLocation;
+use coldstore_proto::tape::read_bundle_response::Payload as TapeReadPayload;
 use coldstore_proto::tape::tape_service_client::TapeServiceClient as TapeGrpcClient;
 use coldstore_proto::tape::write_bundle_request::Payload as TapeWriteRequestPayload;
 use coldstore_proto::tape::{
-    WriteBundleMeta as TapeWriteBundleMeta, WriteBundleRequest as TapeWriteBundleRequest,
+    AcquireDriveRequest, LoadTapeRequest, ReadBundleRequest as TapeReadBundleRequest,
+    ReleaseDriveRequest, WriteBundleMeta as TapeWriteBundleMeta,
+    WriteBundleRequest as TapeWriteBundleRequest,
 };
 use prost_types::Timestamp;
 use sha2::{Digest, Sha256};
@@ -21,8 +29,10 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::RwLock;
 use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::{debug, error, info, warn};
 
 #[tonic::async_trait]
 pub trait Phase1SchedulerBackend: Send + Sync + 'static {
@@ -84,6 +94,13 @@ pub struct ArchiveBatchResult {
     pub archived_objects: u32,
     pub bytes_written: u64,
     pub bundle_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct RecallBatchResult {
+    pub restored_objects: u32,
+    pub bytes_read: u64,
+    pub task_ids: Vec<String>,
 }
 
 #[tonic::async_trait]
@@ -189,6 +206,59 @@ impl Phase1ArchiveCache for CacheArchiveClient {
 }
 
 #[tonic::async_trait]
+pub trait Phase1RestoreCache: Send + Sync {
+    async fn put_restored(
+        &self,
+        object: &common::ObjectMetadata,
+        data: Vec<u8>,
+        expire_at: Timestamp,
+    ) -> std::result::Result<(), Status>;
+}
+
+#[derive(Clone)]
+pub struct CacheRestoreClient {
+    client: CacheServiceClient<tonic::transport::Channel>,
+}
+
+impl CacheRestoreClient {
+    pub fn new(client: CacheServiceClient<tonic::transport::Channel>) -> Self {
+        Self { client }
+    }
+}
+
+#[tonic::async_trait]
+impl Phase1RestoreCache for CacheRestoreClient {
+    async fn put_restored(
+        &self,
+        object: &common::ObjectMetadata,
+        data: Vec<u8>,
+        expire_at: Timestamp,
+    ) -> std::result::Result<(), Status> {
+        let mut client = self.client.clone();
+        client
+            .put_restored(Request::new(tokio_stream::iter(vec![
+                PutRestoredRequest {
+                    payload: Some(PutRestoredPayload::Meta(PutRestoredMeta {
+                        bucket: object.bucket.clone(),
+                        key: object.key.clone(),
+                        version_id: object.version_id.clone(),
+                        size: data.len() as u64,
+                        checksum: Some(sha256_hex(&data)),
+                        content_type: object.content_type.clone(),
+                        etag: object.etag.clone(),
+                        expire_at: Some(expire_at),
+                    })),
+                },
+                PutRestoredRequest {
+                    payload: Some(PutRestoredPayload::Data(data)),
+                },
+            ])))
+            .await?;
+        Ok(())
+    }
+}
+
+#[tonic::async_trait]
 pub trait TapeArchiveWriter: Send + Sync {
     async fn write_bundle(
         &self,
@@ -226,6 +296,78 @@ impl TapeArchiveClient {
 }
 
 #[tonic::async_trait]
+pub trait TapeRecallReader: Send + Sync {
+    async fn read_bundle(
+        &self,
+        tape_id: &str,
+        filemark: u32,
+        length: u64,
+    ) -> std::result::Result<Vec<u8>, Status>;
+}
+
+#[derive(Clone)]
+pub struct TapeRecallClient {
+    client: TapeGrpcClient<tonic::transport::Channel>,
+    drive_id: String,
+}
+
+impl TapeRecallClient {
+    pub fn new(
+        client: TapeGrpcClient<tonic::transport::Channel>,
+        drive_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            client,
+            drive_id: drive_id.into(),
+        }
+    }
+}
+
+async fn acquire_and_load_tape(
+    client: &mut TapeGrpcClient<tonic::transport::Channel>,
+    preferred_drive_id: &str,
+    tape_id: &str,
+) -> std::result::Result<String, Status> {
+    let acquired = client
+        .acquire_drive(Request::new(AcquireDriveRequest {
+            preferred_drive_id: Some(preferred_drive_id.to_string()),
+            required_tape_id: None,
+            priority: 0,
+            timeout_secs: 0,
+        }))
+        .await?
+        .into_inner();
+    let drive_id = if acquired.drive_id.is_empty() {
+        preferred_drive_id.to_string()
+    } else {
+        acquired.drive_id
+    };
+
+    if acquired.current_tape.as_deref() != Some(tape_id) {
+        client
+            .load_tape(Request::new(LoadTapeRequest {
+                tape_id: tape_id.to_string(),
+                drive_id: drive_id.clone(),
+                slot_id: None,
+            }))
+            .await?;
+    }
+
+    Ok(drive_id)
+}
+
+async fn release_drive_best_effort(
+    client: &mut TapeGrpcClient<tonic::transport::Channel>,
+    drive_id: &str,
+) {
+    let _ = client
+        .release_drive(Request::new(ReleaseDriveRequest {
+            drive_id: drive_id.to_string(),
+        }))
+        .await;
+}
+
+#[tonic::async_trait]
 impl TapeArchiveWriter for TapeArchiveClient {
     async fn write_bundle(
         &self,
@@ -234,23 +376,29 @@ impl TapeArchiveWriter for TapeArchiveClient {
         data: Vec<u8>,
     ) -> std::result::Result<TapeArchiveWrite, Status> {
         let mut client = self.client.clone();
-        let response = client
-            .write_bundle(Request::new(tokio_stream::iter(vec![
-                TapeWriteBundleRequest {
-                    payload: Some(TapeWriteRequestPayload::Meta(TapeWriteBundleMeta {
-                        drive_id: self.drive_id.clone(),
-                        bundle_id: bundle_id.into(),
-                        total_size: data.len() as u64,
-                        object_count,
-                        block_size: self.block_size,
-                    })),
-                },
-                TapeWriteBundleRequest {
-                    payload: Some(TapeWriteRequestPayload::Data(data)),
-                },
-            ])))
-            .await?
-            .into_inner();
+        let drive_id = acquire_and_load_tape(&mut client, &self.drive_id, &self.tape_id).await?;
+        let response = async {
+            client
+                .write_bundle(Request::new(tokio_stream::iter(vec![
+                    TapeWriteBundleRequest {
+                        payload: Some(TapeWriteRequestPayload::Meta(TapeWriteBundleMeta {
+                            drive_id: drive_id.clone(),
+                            bundle_id: bundle_id.into(),
+                            total_size: data.len() as u64,
+                            object_count,
+                            block_size: self.block_size,
+                        })),
+                    },
+                    TapeWriteBundleRequest {
+                        payload: Some(TapeWriteRequestPayload::Data(data)),
+                    },
+                ])))
+                .await
+                .map(|response| response.into_inner())
+        }
+        .await;
+        release_drive_best_effort(&mut client, &drive_id).await;
+        let response = response?;
 
         if !response.success {
             return Err(Status::internal(format!(
@@ -260,10 +408,10 @@ impl TapeArchiveWriter for TapeArchiveClient {
                     .unwrap_or_else(|| "unknown tape error".into())
             )));
         }
-        if response.drive_id != self.drive_id {
+        if response.drive_id != drive_id {
             return Err(Status::internal(format!(
                 "tape write_bundle responded for drive {}, expected {}",
-                response.drive_id, self.drive_id
+                response.drive_id, drive_id
             )));
         }
         if response.bundle_id != bundle_id {
@@ -283,10 +431,72 @@ impl TapeArchiveWriter for TapeArchiveClient {
     }
 }
 
+#[tonic::async_trait]
+impl TapeRecallReader for TapeRecallClient {
+    async fn read_bundle(
+        &self,
+        tape_id: &str,
+        filemark: u32,
+        length: u64,
+    ) -> std::result::Result<Vec<u8>, Status> {
+        let mut client = self.client.clone();
+        let drive_id = acquire_and_load_tape(&mut client, &self.drive_id, tape_id).await?;
+        let result = async {
+            let mut stream = client
+                .read_bundle(Request::new(TapeReadBundleRequest {
+                    drive_id: drive_id.clone(),
+                    location: Some(TapeReadLocation::Filemark(filemark)),
+                    length,
+                }))
+                .await?
+                .into_inner();
+
+            let mut expected_size = None;
+            let mut data = Vec::new();
+            while let Some(message) = stream.message().await? {
+                match message.payload {
+                    Some(TapeReadPayload::Meta(meta)) => {
+                        if expected_size.replace(meta.total_size).is_some() {
+                            return Err(Status::internal("tape read returned duplicate metadata"));
+                        }
+                    }
+                    Some(TapeReadPayload::Data(chunk)) => data.extend_from_slice(&chunk),
+                    None => return Err(Status::internal("tape read returned empty chunk")),
+                }
+            }
+
+            if let Some(expected_size) = expected_size {
+                if expected_size != data.len() as u64 {
+                    return Err(Status::data_loss(format!(
+                        "tape read returned {} bytes, expected {}",
+                        data.len(),
+                        expected_size
+                    )));
+                }
+            }
+            Ok(data)
+        }
+        .await;
+        release_drive_best_effort(&mut client, &drive_id).await;
+        result
+    }
+}
+
 pub struct MetadataBackedSchedulerBackend {
     metadata: coldstore_proto::metadata::metadata_service_client::MetadataServiceClient<
         tonic::transport::Channel,
     >,
+    cache: Option<CacheServiceClient<tonic::transport::Channel>>,
+}
+
+struct StagingPut {
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    data: Vec<u8>,
+    checksum: String,
+    content_type: Option<String>,
+    etag: String,
 }
 
 impl MetadataBackedSchedulerBackend {
@@ -295,7 +505,146 @@ impl MetadataBackedSchedulerBackend {
             tonic::transport::Channel,
         >,
     ) -> Self {
-        Self { metadata }
+        Self {
+            metadata,
+            cache: None,
+        }
+    }
+
+    pub fn new_with_cache(
+        metadata: coldstore_proto::metadata::metadata_service_client::MetadataServiceClient<
+            tonic::transport::Channel,
+        >,
+        cache: Option<CacheServiceClient<tonic::transport::Channel>>,
+    ) -> Self {
+        Self { metadata, cache }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn cache_client(
+        &self,
+    ) -> std::result::Result<CacheServiceClient<tonic::transport::Channel>, Status> {
+        self.cache
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("scheduler cache client is not configured"))
+    }
+
+    async fn put_staging_object(&self, staging: StagingPut) -> std::result::Result<String, Status> {
+        let mut client = self.cache_client()?;
+        let size = staging.data.len() as u64;
+        Ok(client
+            .put_staging(Request::new(tokio_stream::iter(vec![
+                PutStagingRequest {
+                    payload: Some(PutStagingPayload::Meta(PutStagingMeta {
+                        bucket: staging.bucket,
+                        key: staging.key,
+                        version_id: staging.version_id,
+                        size,
+                        checksum: Some(staging.checksum),
+                        content_type: staging.content_type,
+                        etag: Some(staging.etag),
+                    })),
+                },
+                PutStagingRequest {
+                    payload: Some(PutStagingPayload::Data(staging.data)),
+                },
+            ])))
+            .await?
+            .into_inner()
+            .staging_id)
+    }
+
+    async fn delete_staging_best_effort(&self, bucket: &str, key: &str, version_id: Option<&str>) {
+        if let Some(cache) = &self.cache {
+            let mut client = cache.clone();
+            let _ = client
+                .delete_staging(Request::new(DeleteStagingRequest {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    version_id: version_id.map(str::to_owned),
+                }))
+                .await;
+        }
+    }
+
+    async fn read_restored_object(
+        &self,
+        object: &common::ObjectMetadata,
+    ) -> std::result::Result<Vec<u8>, Status> {
+        if object.storage_class != common::StorageClass::Cold as i32 {
+            return Err(Status::failed_precondition(format!(
+                "object {}/{} is not archived yet and cannot be read from restored cache",
+                object.bucket, object.key
+            )));
+        }
+
+        let restore_status = object
+            .restore_status
+            .and_then(|status| common::RestoreStatus::try_from(status).ok());
+        if restore_status != Some(common::RestoreStatus::RestoreCompleted) {
+            return Err(Status::failed_precondition(format!(
+                "object {}/{} must complete restore before GET",
+                object.bucket, object.key
+            )));
+        }
+
+        let mut client = self.cache_client()?;
+        let mut stream = client
+            .get(Request::new(CacheGetRequest {
+                bucket: object.bucket.clone(),
+                key: object.key.clone(),
+                version_id: object.version_id.clone(),
+            }))
+            .await
+            .map_err(|status| {
+                if status.code() == tonic::Code::NotFound {
+                    Status::failed_precondition(format!(
+                        "restored object {}/{} is not present in cache",
+                        object.bucket, object.key
+                    ))
+                } else {
+                    status
+                }
+            })?
+            .into_inner();
+
+        let mut expected_size = None;
+        let mut data = Vec::new();
+        while let Some(message) = stream.message().await? {
+            match message.payload {
+                Some(CacheGetPayload::Meta(meta)) => {
+                    if expected_size.replace(meta.size).is_some() {
+                        return Err(Status::invalid_argument(
+                            "cache get returned duplicate metadata",
+                        ));
+                    }
+                }
+                Some(CacheGetPayload::Data(chunk)) => data.extend_from_slice(&chunk),
+                None => return Err(Status::internal("cache get returned empty chunk")),
+            }
+        }
+
+        let expected_size = expected_size
+            .ok_or_else(|| Status::internal("cache get stream ended without metadata"))?;
+        if expected_size != data.len() as u64 {
+            return Err(Status::data_loss(format!(
+                "cache returned {} bytes for {}/{}, expected {}",
+                data.len(),
+                object.bucket,
+                object.key,
+                expected_size
+            )));
+        }
+        if object.size != data.len() as u64 {
+            return Err(Status::data_loss(format!(
+                "metadata size {} for {}/{} does not match restored cache bytes {}",
+                object.size,
+                object.bucket,
+                object.key,
+                data.len()
+            )));
+        }
+        Ok(data)
     }
 
     pub async fn archive_staging_batch<C, T>(
@@ -405,6 +754,166 @@ impl MetadataBackedSchedulerBackend {
 
         Ok(result)
     }
+
+    async fn update_recall_task(
+        &self,
+        task: common::RecallTask,
+    ) -> std::result::Result<(), Status> {
+        let mut client = self.metadata.clone();
+        client.update_recall_task(Request::new(task)).await?;
+        Ok(())
+    }
+
+    async fn update_object_restore_status(
+        &self,
+        bucket: &str,
+        key: &str,
+        status: common::RestoreStatus,
+        expire_at: Option<Timestamp>,
+    ) -> std::result::Result<(), Status> {
+        let mut client = self.metadata.clone();
+        client
+            .update_restore_status(Request::new(
+                coldstore_proto::metadata::UpdateRestoreStatusRequest {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    status: status as i32,
+                    expire_at,
+                },
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_recall_failed(
+        &self,
+        mut task: common::RecallTask,
+        error: String,
+    ) -> std::result::Result<(), Status> {
+        task.status = common::RestoreStatus::RestoreFailed as i32;
+        task.retry_count = task.retry_count.saturating_add(1);
+        task.completed_at = Some(now_timestamp());
+        task.error = Some(error);
+        self.update_recall_task(task.clone()).await?;
+        self.update_object_restore_status(
+            &task.bucket,
+            &task.key,
+            common::RestoreStatus::RestoreFailed,
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn recall_pending_batch<C, T>(
+        &self,
+        cache: &C,
+        tape: &T,
+        limit: usize,
+    ) -> std::result::Result<RecallBatchResult, Status>
+    where
+        C: Phase1RestoreCache + ?Sized,
+        T: TapeRecallReader + ?Sized,
+    {
+        let mut client = self.metadata.clone();
+        let tasks = client
+            .list_pending_recall_tasks(Request::new(()))
+            .await?
+            .into_inner()
+            .tasks;
+        let mut result = RecallBatchResult::default();
+
+        for task in tasks.into_iter().filter(is_pending_recall_task).take(limit) {
+            let restore_result = self.process_recall_task(cache, tape, task.clone()).await;
+            match restore_result {
+                Ok(bytes_read) => {
+                    result.restored_objects += 1;
+                    result.bytes_read += bytes_read;
+                    result.task_ids.push(task.id);
+                }
+                Err(status) => {
+                    self.mark_recall_failed(task, status.message().to_string())
+                        .await?;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn process_recall_task<C, T>(
+        &self,
+        cache: &C,
+        tape: &T,
+        mut task: common::RecallTask,
+    ) -> std::result::Result<u64, Status>
+    where
+        C: Phase1RestoreCache + ?Sized,
+        T: TapeRecallReader + ?Sized,
+    {
+        let object = self.head_object(&task.bucket, &task.key).await?;
+        if object.storage_class != common::StorageClass::Cold as i32 {
+            return Err(Status::failed_precondition(format!(
+                "recall task {} requires a COLD object",
+                task.id
+            )));
+        }
+        if object.archive_id.as_deref() != Some(task.archive_id.as_str()) {
+            return Err(Status::failed_precondition(format!(
+                "recall task {} archive_id does not match current object metadata",
+                task.id
+            )));
+        }
+
+        task.status = common::RestoreStatus::RestoreInProgress as i32;
+        task.started_at = Some(now_timestamp());
+        self.update_recall_task(task.clone()).await?;
+        self.update_object_restore_status(
+            &task.bucket,
+            &task.key,
+            common::RestoreStatus::RestoreInProgress,
+            Some(task.expire_at.unwrap_or_else(|| days_from_now(1))),
+        )
+        .await?;
+
+        let filemark = u32::try_from(task.tape_block_offset)
+            .map_err(|_| Status::invalid_argument("recall tape offset does not fit filemark"))?;
+        let data = tape
+            .read_bundle(&task.tape_id, filemark, task.object_size)
+            .await?;
+        if data.len() as u64 != task.object_size {
+            return Err(Status::data_loss(format!(
+                "recall task {} read {} bytes, expected {}",
+                task.id,
+                data.len(),
+                task.object_size
+            )));
+        }
+        let checksum = sha256_hex(&data);
+        if checksum != task.checksum {
+            return Err(Status::data_loss(format!(
+                "recall task {} checksum mismatch",
+                task.id
+            )));
+        }
+
+        let expire_at = task.expire_at.unwrap_or_else(|| days_from_now(1));
+        cache.put_restored(&object, data, expire_at).await?;
+
+        task.status = common::RestoreStatus::RestoreCompleted as i32;
+        task.completed_at = Some(now_timestamp());
+        task.error = None;
+        self.update_recall_task(task.clone()).await?;
+        self.update_object_restore_status(
+            &task.bucket,
+            &task.key,
+            common::RestoreStatus::RestoreCompleted,
+            Some(expire_at),
+        )
+        .await?;
+
+        Ok(task.object_size)
+    }
 }
 
 #[tonic::async_trait]
@@ -476,10 +985,8 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
         key: &str,
     ) -> std::result::Result<(common::ObjectMetadata, Vec<u8>), Status> {
         let object = self.head_object(bucket, key).await?;
-        Err(Status::failed_precondition(format!(
-            "scheduler.get_object requires phase-1 cache wiring; metadata is available for {}/{} but body retrieval is not yet connected",
-            object.bucket, object.key
-        )))
+        let data = self.read_restored_object(&object).await?;
+        Ok((object, data))
     }
 
     async fn put_object(
@@ -490,12 +997,25 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
         content_type: Option<String>,
     ) -> std::result::Result<PutObjectResponse, Status> {
         let checksum = sha256_hex(&body);
+        let size = body.len() as u64;
+        let version_id: Option<String> = None;
+        let _staging_id = self
+            .put_staging_object(StagingPut {
+                bucket: bucket.into(),
+                key: key.into(),
+                version_id: version_id.clone(),
+                data: body,
+                checksum: checksum.clone(),
+                content_type: content_type.clone(),
+                etag: checksum.clone(),
+            })
+            .await?;
         let now = now_timestamp();
         let object = common::ObjectMetadata {
             bucket: bucket.into(),
             key: key.into(),
-            version_id: None,
-            size: body.len() as u64,
+            version_id: version_id.clone(),
+            size,
             checksum: checksum.clone(),
             content_type,
             etag: Some(checksum.clone()),
@@ -510,7 +1030,11 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
             updated_at: Some(now),
         };
         let mut client = self.metadata.clone();
-        client.put_object(Request::new(object)).await?;
+        if let Err(status) = client.put_object(Request::new(object)).await {
+            self.delete_staging_best_effort(bucket, key, version_id.as_deref())
+                .await;
+            return Err(status);
+        }
         Ok(PutObjectResponse {
             etag: checksum,
             version_id: String::new(),
@@ -535,7 +1059,7 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
         bucket: &str,
         key: &str,
         days: u32,
-        _tier: common::RestoreTier,
+        tier: common::RestoreTier,
     ) -> std::result::Result<RestoreObjectResponse, Status> {
         let mut client = self.metadata.clone();
         let object = client
@@ -571,16 +1095,59 @@ impl Phase1SchedulerBackend for MetadataBackedSchedulerBackend {
                 ))
             }
             Some(common::RestoreStatus::Unspecified) | None => {
+                let archive_id = object.archive_id.clone().ok_or_else(|| {
+                    Status::failed_precondition("restore_object requires archive_id metadata")
+                })?;
+                let tape_id = object.tape_id.clone().ok_or_else(|| {
+                    Status::failed_precondition("restore_object requires tape_id metadata")
+                })?;
+                let tape_block_offset = object.tape_block_offset.ok_or_else(|| {
+                    Status::failed_precondition("restore_object requires tape_block_offset metadata")
+                })?;
+                let expire_at = days_from_now(days.max(1));
                 client
                     .update_restore_status(Request::new(
                         coldstore_proto::metadata::UpdateRestoreStatusRequest {
                             bucket: bucket.into(),
                             key: key.into(),
                             status: common::RestoreStatus::RestorePending as i32,
-                            expire_at: Some(days_from_now(days.max(1))),
+                            expire_at: Some(expire_at),
                         },
                     ))
                     .await?;
+                let task = common::RecallTask {
+                    id: phase1_recall_task_id(bucket, key, object.version_id.as_deref()),
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    version_id: object.version_id.clone(),
+                    archive_id,
+                    tape_id,
+                    tape_set: object.tape_set.clone(),
+                    tape_block_offset,
+                    object_size: object.size,
+                    checksum: object.checksum.clone(),
+                    tier: tier as i32,
+                    days: days.max(1),
+                    expire_at: Some(expire_at),
+                    status: common::RestoreStatus::RestorePending as i32,
+                    drive_id: None,
+                    retry_count: 0,
+                    created_at: Some(now_timestamp()),
+                    started_at: None,
+                    completed_at: None,
+                    error: None,
+                };
+                if let Err(status) = client.put_recall_task(Request::new(task)).await {
+                    let _ = self
+                        .update_object_restore_status(
+                            bucket,
+                            key,
+                            common::RestoreStatus::RestoreFailed,
+                            None,
+                        )
+                        .await;
+                    return Err(status);
+                }
                 Ok(RestoreObjectResponse { status_code: 202 })
             }
         }
@@ -616,7 +1183,10 @@ pub struct SchedulerServiceImpl {
 
 impl SchedulerServiceImpl {
     pub fn new(state: Arc<SchedulerState>) -> Self {
-        let backend = Arc::new(MetadataBackedSchedulerBackend::new(state.metadata.clone()));
+        let backend = Arc::new(MetadataBackedSchedulerBackend::new_with_cache(
+            state.metadata.clone(),
+            state.cache.clone(),
+        ));
         Self {
             _state: state,
             backend,
@@ -736,11 +1306,152 @@ fn storage_class_label(storage_class: i32) -> &'static str {
     }
 }
 
+fn is_pending_recall_task(task: &common::RecallTask) -> bool {
+    common::RestoreStatus::try_from(task.status) == Ok(common::RestoreStatus::RestorePending)
+}
+
 fn phase1_bundle_id(bucket: &str, key: &str, version_id: Option<&str>) -> String {
     match version_id.filter(|version| !version.is_empty()) {
         Some(version) => format!("phase1-bundle:{bucket}/{key}#{version}"),
         None => format!("phase1-bundle:{bucket}/{key}"),
     }
+}
+
+fn phase1_recall_task_id(bucket: &str, key: &str, version_id: Option<&str>) -> String {
+    match version_id.filter(|version| !version.is_empty()) {
+        Some(version) => format!(
+            "phase1-recall:{bucket}/{key}#{version}:{}",
+            uuid::Uuid::new_v4()
+        ),
+        None => format!("phase1-recall:{bucket}/{key}:{}", uuid::Uuid::new_v4()),
+    }
+}
+
+pub fn spawn_background_loops(state: Arc<SchedulerState>) {
+    if state.config.archive.enabled {
+        tokio::spawn(run_archive_loop(state.clone()));
+    } else {
+        info!("scheduler archive background loop disabled");
+    }
+
+    if state.config.recall.enabled {
+        tokio::spawn(run_recall_loop(state));
+    } else {
+        info!("scheduler recall background loop disabled");
+    }
+}
+
+async fn run_archive_loop(state: Arc<SchedulerState>) {
+    let every = Duration::from_secs(state.config.archive.scan_interval_secs.max(1));
+    let mut ticker = interval(every);
+    info!(
+        "scheduler archive background loop enabled: interval={}s batch_size={}",
+        every.as_secs(),
+        state.config.archive.batch_size
+    );
+
+    loop {
+        ticker.tick().await;
+        match archive_staging_once(state.clone()).await {
+            Ok(result) if result.archived_objects > 0 => {
+                info!(
+                    archived_objects = result.archived_objects,
+                    bytes_written = result.bytes_written,
+                    "scheduler archive loop archived staging objects"
+                );
+            }
+            Ok(_) => debug!("scheduler archive loop found no staging objects"),
+            Err(status) => warn!(
+                code = ?status.code(),
+                message = status.message(),
+                "scheduler archive loop failed"
+            ),
+        }
+    }
+}
+
+async fn run_recall_loop(state: Arc<SchedulerState>) {
+    let every = Duration::from_secs(state.config.recall.scan_interval_secs.max(1));
+    let mut ticker = interval(every);
+    info!(
+        "scheduler recall background loop enabled: interval={}s max_concurrent_restores={}",
+        every.as_secs(),
+        state.config.recall.max_concurrent_restores
+    );
+
+    loop {
+        ticker.tick().await;
+        match recall_pending_once(state.clone()).await {
+            Ok(result) if result.restored_objects > 0 => {
+                info!(
+                    restored_objects = result.restored_objects,
+                    bytes_read = result.bytes_read,
+                    "scheduler recall loop restored objects"
+                );
+            }
+            Ok(_) => debug!("scheduler recall loop found no pending recall tasks"),
+            Err(status) => error!(
+                code = ?status.code(),
+                message = status.message(),
+                "scheduler recall loop failed"
+            ),
+        }
+    }
+}
+
+pub async fn archive_staging_once(
+    state: Arc<SchedulerState>,
+) -> std::result::Result<ArchiveBatchResult, Status> {
+    let cache = state
+        .cache
+        .clone()
+        .ok_or_else(|| Status::failed_precondition("scheduler cache client is not configured"))?;
+    let tape = state
+        .tape
+        .clone()
+        .ok_or_else(|| Status::failed_precondition("scheduler tape client is not configured"))?;
+    let backend =
+        MetadataBackedSchedulerBackend::new_with_cache(state.metadata.clone(), Some(cache.clone()));
+    let cache = CacheArchiveClient::new(cache);
+    let tape_set = if state.config.archive.tape_set.is_empty() {
+        vec![state.config.archive.tape_id.clone()]
+    } else {
+        state.config.archive.tape_set.clone()
+    };
+    let tape = TapeArchiveClient::new(
+        tape,
+        state.config.archive.drive_id.clone(),
+        state.config.archive.tape_id.clone(),
+        tape_set,
+        state.config.archive.block_size,
+    );
+    backend
+        .archive_staging_batch(
+            &cache,
+            &tape,
+            state.config.archive.batch_size.min(u32::MAX as usize) as u32,
+        )
+        .await
+}
+
+pub async fn recall_pending_once(
+    state: Arc<SchedulerState>,
+) -> std::result::Result<RecallBatchResult, Status> {
+    let cache = state
+        .cache
+        .clone()
+        .ok_or_else(|| Status::failed_precondition("scheduler cache client is not configured"))?;
+    let tape = state
+        .tape
+        .clone()
+        .ok_or_else(|| Status::failed_precondition("scheduler tape client is not configured"))?;
+    let backend =
+        MetadataBackedSchedulerBackend::new_with_cache(state.metadata.clone(), Some(cache.clone()));
+    let cache = CacheRestoreClient::new(cache);
+    let tape = TapeRecallClient::new(tape, state.config.recall.drive_id.clone());
+    backend
+        .recall_pending_batch(&cache, &tape, state.config.recall.max_concurrent_restores)
+        .await
 }
 
 #[tonic::async_trait]
@@ -931,10 +1642,11 @@ mod tests {
     use coldstore_metadata::service::MetadataServiceImpl;
     use coldstore_proto::cache::cache_service_client::CacheServiceClient;
     use coldstore_proto::cache::cache_service_server::CacheServiceServer;
+    use coldstore_proto::cache::put_restored_request::Payload as PutRestoredPayload;
     use coldstore_proto::cache::put_staging_request::Payload as PutStagingPayload;
     use coldstore_proto::cache::{
-        GetStagingRequest, ListStagingKeysRequest, PutStagingMeta, PutStagingRequest,
-        StagingKeyEntry, StagingObjectMeta,
+        GetStagingRequest, ListStagingKeysRequest, PutRestoredMeta, PutRestoredRequest,
+        PutStagingMeta, PutStagingRequest, StagingKeyEntry, StagingObjectMeta,
     };
     use coldstore_proto::metadata::metadata_service_server::MetadataServiceServer;
     use coldstore_proto::tape::read_bundle_request::Location as TapeReadLocation;
@@ -1447,6 +2159,98 @@ mod tests {
         (cache_client.expect("connect cache client"), shutdown_tx)
     }
 
+    async fn seed_object_metadata(
+        metadata: &mut coldstore_proto::metadata::metadata_service_client::MetadataServiceClient<
+            Channel,
+        >,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        storage_class: common::StorageClass,
+        restore_status: Option<common::RestoreStatus>,
+    ) {
+        let now = Timestamp {
+            seconds: 10,
+            nanos: 0,
+        };
+        metadata
+            .put_object(Request::new(common::ObjectMetadata {
+                bucket: bucket.into(),
+                key: key.into(),
+                version_id: None,
+                size: body.len() as u64,
+                checksum: sha256_hex(body),
+                content_type: Some("text/plain".into()),
+                etag: Some(sha256_hex(body)),
+                storage_class: storage_class as i32,
+                archive_id: None,
+                tape_id: None,
+                tape_set: vec![],
+                tape_block_offset: None,
+                restore_status: restore_status.map(|status| status as i32),
+                restore_expire_at: restore_status.map(|_| days_from_now(1)),
+                created_at: Some(now),
+                updated_at: Some(now),
+            }))
+            .await
+            .expect("seed object metadata");
+    }
+
+    async fn read_staging_object(
+        cache: &mut CacheServiceClient<Channel>,
+        bucket: &str,
+        key: &str,
+    ) -> (StagingObjectMeta, Vec<u8>) {
+        let mut stream = cache
+            .get_staging(Request::new(GetStagingRequest {
+                bucket: bucket.into(),
+                key: key.into(),
+                version_id: None,
+            }))
+            .await
+            .expect("get staging")
+            .into_inner();
+        let mut meta = None;
+        let mut body = Vec::new();
+        while let Some(message) = stream.next().await {
+            match message.expect("staging message").payload.expect("payload") {
+                GetStagingPayload::Meta(next_meta) => {
+                    assert!(meta.replace(next_meta).is_none(), "duplicate staging meta");
+                }
+                GetStagingPayload::Data(bytes) => body.extend_from_slice(&bytes),
+            }
+        }
+        (meta.expect("staging meta"), body)
+    }
+
+    async fn put_restored_cache_object(
+        cache: &mut CacheServiceClient<Channel>,
+        bucket: &str,
+        key: &str,
+        body: Vec<u8>,
+    ) {
+        cache
+            .put_restored(Request::new(tokio_stream::iter(vec![
+                PutRestoredRequest {
+                    payload: Some(PutRestoredPayload::Meta(PutRestoredMeta {
+                        bucket: bucket.into(),
+                        key: key.into(),
+                        version_id: None,
+                        size: body.len() as u64,
+                        checksum: Some(sha256_hex(&body)),
+                        content_type: Some("text/plain".into()),
+                        etag: Some(sha256_hex(&body)),
+                        expire_at: Some(days_from_now(1)),
+                    })),
+                },
+                PutRestoredRequest {
+                    payload: Some(PutRestoredPayload::Data(body)),
+                },
+            ])))
+            .await
+            .expect("put restored cache object");
+    }
+
     async fn tape_backed_service() -> (TapeServiceClient<Channel>, oneshot::Sender<()>) {
         let backend = SimulatorTapeBackend::new(2, 1);
         backend.insert_tape("slot-1", "TAPE-GRPC").unwrap();
@@ -1601,6 +2405,19 @@ mod tests {
 
         let mut metadata = state.metadata.clone();
         metadata
+            .update_archive_location(Request::new(
+                coldstore_proto::metadata::UpdateArchiveLocationRequest {
+                    bucket: "docs".into(),
+                    key: "guide.txt".into(),
+                    archive_id: "archive-guide".into(),
+                    tape_id: "TAPE-PHASE1".into(),
+                    tape_set: vec!["TAPE-PHASE1".into()],
+                    tape_block_offset: 0,
+                },
+            ))
+            .await
+            .expect("set archive location");
+        metadata
             .update_storage_class(Request::new(
                 coldstore_proto::metadata::UpdateStorageClassRequest {
                     bucket: "docs".into(),
@@ -1659,9 +2476,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_metadata_backend_puts_object_and_reports_cache_gap() {
+    async fn default_metadata_backend_rejects_put_when_cache_is_missing() {
         let (_svc, state, shutdown_tx) = metadata_backed_service().await;
         let backend = MetadataBackedSchedulerBackend::new(state.metadata.clone());
+
+        backend
+            .create_bucket("docs")
+            .await
+            .expect("create bucket through metadata backend");
+
+        let err = backend
+            .put_object(
+                "docs",
+                "guide.txt",
+                b"hello".to_vec(),
+                Some("text/plain".into()),
+            )
+            .await
+            .expect_err("put object requires cache staging");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("cache client"));
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn default_metadata_backend_puts_object_into_cache_staging_and_metadata() {
+        let (_svc, state, metadata_shutdown_tx) = metadata_backed_service().await;
+        let (mut raw_cache_client, cache_shutdown_tx) = cache_backed_service().await;
+        let backend = MetadataBackedSchedulerBackend::new_with_cache(
+            state.metadata.clone(),
+            Some(raw_cache_client.clone()),
+        );
 
         backend
             .create_bucket("docs")
@@ -1676,7 +2522,7 @@ mod tests {
                 Some("text/plain".into()),
             )
             .await
-            .expect("put object through metadata backend");
+            .expect("put object through cache-backed metadata backend");
         assert!(!put.etag.is_empty());
 
         let listed = backend
@@ -1685,15 +2531,130 @@ mod tests {
             .expect("list objects through metadata backend");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].etag.as_deref(), Some(put.etag.as_str()));
+        assert_eq!(
+            listed[0].storage_class,
+            common::StorageClass::ColdPending as i32
+        );
 
-        let err = backend
+        let (staging_meta, staging_body) =
+            read_staging_object(&mut raw_cache_client, "docs", "guide.txt").await;
+        assert_eq!(staging_meta.size, 5);
+        assert_eq!(staging_meta.checksum.as_deref(), Some(put.etag.as_str()));
+        assert_eq!(staging_body, b"hello");
+
+        metadata_shutdown_tx.send(()).ok();
+        cache_shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn default_metadata_backend_gets_object_from_restored_cache() {
+        let (_svc, state, metadata_shutdown_tx) = metadata_backed_service().await;
+        let (mut raw_cache_client, cache_shutdown_tx) = cache_backed_service().await;
+        let backend = MetadataBackedSchedulerBackend::new_with_cache(
+            state.metadata.clone(),
+            Some(raw_cache_client.clone()),
+        );
+
+        backend
+            .create_bucket("docs")
+            .await
+            .expect("create bucket through metadata backend");
+        let body = b"restored-body".to_vec();
+        let mut metadata = state.metadata.clone();
+        seed_object_metadata(
+            &mut metadata,
+            "docs",
+            "guide.txt",
+            &body,
+            common::StorageClass::Cold,
+            Some(common::RestoreStatus::RestoreCompleted),
+        )
+        .await;
+        put_restored_cache_object(&mut raw_cache_client, "docs", "guide.txt", body.clone()).await;
+
+        let (object, data) = backend
             .get_object("docs", "guide.txt")
             .await
-            .expect_err("get_object should explain that cache is still not wired");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("cache wiring"));
+            .expect("get restored object");
+        assert_eq!(
+            object.restore_status,
+            Some(common::RestoreStatus::RestoreCompleted as i32)
+        );
+        assert_eq!(data, body);
 
-        shutdown_tx.send(()).ok();
+        metadata_shutdown_tx.send(()).ok();
+        cache_shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn restore_object_creates_pending_recall_task() {
+        let (_svc, state, metadata_shutdown_tx) = metadata_backed_service().await;
+        let backend = MetadataBackedSchedulerBackend::new(state.metadata.clone());
+
+        backend
+            .create_bucket("docs")
+            .await
+            .expect("create bucket through metadata backend");
+        let body = b"archive-me".to_vec();
+        let mut metadata = state.metadata.clone();
+        seed_object_metadata(
+            &mut metadata,
+            "docs",
+            "restore.txt",
+            &body,
+            common::StorageClass::Cold,
+            None,
+        )
+        .await;
+        metadata
+            .update_archive_location(Request::new(
+                coldstore_proto::metadata::UpdateArchiveLocationRequest {
+                    bucket: "docs".into(),
+                    key: "restore.txt".into(),
+                    archive_id: "archive-restore".into(),
+                    tape_id: "TAPE-RESTORE".into(),
+                    tape_set: vec!["TAPE-RESTORE".into()],
+                    tape_block_offset: 7,
+                },
+            ))
+            .await
+            .expect("set archive location");
+
+        let response = backend
+            .restore_object("docs", "restore.txt", 5, common::RestoreTier::Standard)
+            .await
+            .expect("queue restore");
+        assert_eq!(response.status_code, 202);
+
+        let object = backend
+            .head_object("docs", "restore.txt")
+            .await
+            .expect("head restored-pending object");
+        assert_eq!(
+            object.restore_status,
+            Some(common::RestoreStatus::RestorePending as i32)
+        );
+
+        let tasks = metadata
+            .list_pending_recall_tasks(Request::new(()))
+            .await
+            .expect("list pending recall tasks")
+            .into_inner()
+            .tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].bucket, "docs");
+        assert_eq!(tasks[0].key, "restore.txt");
+        assert_eq!(tasks[0].archive_id, "archive-restore");
+        assert_eq!(tasks[0].tape_id, "TAPE-RESTORE");
+        assert_eq!(tasks[0].tape_block_offset, 7);
+        assert_eq!(tasks[0].object_size, body.len() as u64);
+        assert_eq!(tasks[0].checksum, sha256_hex(&body));
+        assert_eq!(
+            tasks[0].status,
+            common::RestoreStatus::RestorePending as i32
+        );
+
+        metadata_shutdown_tx.send(()).ok();
     }
 
     struct TestArchiveCache {
@@ -1870,15 +2831,16 @@ mod tests {
             .create_bucket("docs")
             .await
             .expect("create bucket through metadata backend");
-        backend
-            .put_object(
-                "docs",
-                "guide.txt",
-                b"abcdef".to_vec(),
-                Some("text/plain".into()),
-            )
-            .await
-            .expect("put object metadata");
+        let mut metadata = state.metadata.clone();
+        seed_object_metadata(
+            &mut metadata,
+            "docs",
+            "guide.txt",
+            b"abcdef",
+            common::StorageClass::ColdPending,
+            None,
+        )
+        .await;
 
         let cache = TestArchiveCache::with_object("docs", "guide.txt", b"abcdef".to_vec());
         let tape = DirectTapeWriter::loaded().await;
@@ -1938,15 +2900,16 @@ mod tests {
             .create_bucket("docs")
             .await
             .expect("create bucket through metadata backend");
-        backend
-            .put_object(
-                "docs",
-                "from-cache.txt",
-                b"cache-body".to_vec(),
-                Some("text/plain".into()),
-            )
-            .await
-            .expect("put object metadata");
+        let mut metadata = state.metadata.clone();
+        seed_object_metadata(
+            &mut metadata,
+            "docs",
+            "from-cache.txt",
+            b"cache-body",
+            common::StorageClass::ColdPending,
+            None,
+        )
+        .await;
 
         let (mut raw_cache_client, cache_shutdown_tx) = cache_backed_service().await;
         let body = b"cache-body".to_vec();
@@ -2029,15 +2992,16 @@ mod tests {
             .await
             .expect("create bucket through metadata backend");
         let body = b"grpc-tape-body".to_vec();
-        backend
-            .put_object(
-                "docs",
-                "grpc-tape.txt",
-                body.clone(),
-                Some("text/plain".into()),
-            )
-            .await
-            .expect("put object metadata");
+        let mut metadata = state.metadata.clone();
+        seed_object_metadata(
+            &mut metadata,
+            "docs",
+            "grpc-tape.txt",
+            &body,
+            common::StorageClass::ColdPending,
+            None,
+        )
+        .await;
 
         let (mut raw_cache_client, cache_shutdown_tx) = cache_backed_service().await;
         raw_cache_client
@@ -2103,6 +3067,91 @@ mod tests {
             read_tape_client_filemark(&mut raw_tape_client, 0, body.len() as u64).await,
             body
         );
+
+        metadata_shutdown_tx.send(()).ok();
+        cache_shutdown_tx.send(()).ok();
+        tape_shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn scheduler_background_once_archives_and_restores_via_grpc_clients() {
+        let (_svc, state, metadata_shutdown_tx) = metadata_backed_service().await;
+        let (mut raw_cache_client, cache_shutdown_tx) = cache_backed_service().await;
+        let (raw_tape_client, tape_shutdown_tx) = tape_backed_service().await;
+        let backend = MetadataBackedSchedulerBackend::new_with_cache(
+            state.metadata.clone(),
+            Some(raw_cache_client.clone()),
+        );
+
+        backend
+            .create_bucket("docs")
+            .await
+            .expect("create bucket through metadata backend");
+        let body = b"background-loop-body".to_vec();
+        backend
+            .put_object("docs", "loop.txt", body.clone(), Some("text/plain".into()))
+            .await
+            .expect("put object into staging");
+
+        let mut config = SchedulerConfig::default();
+        config.archive.batch_size = 10;
+        config.archive.drive_id = "drive-0".into();
+        config.archive.tape_id = "TAPE-GRPC".into();
+        config.archive.tape_set = vec!["TAPE-GRPC".into()];
+        config.recall.max_concurrent_restores = 2;
+        config.recall.drive_id = "drive-0".into();
+        let loop_state = Arc::new(SchedulerState {
+            metadata: state.metadata.clone(),
+            cache: Some(raw_cache_client.clone()),
+            tape: Some(raw_tape_client.clone()),
+            config,
+        });
+
+        let archived = archive_staging_once(loop_state.clone())
+            .await
+            .expect("archive once");
+        assert_eq!(archived.archived_objects, 1);
+        assert_eq!(archived.bytes_written, body.len() as u64);
+
+        let archived_object = backend
+            .head_object("docs", "loop.txt")
+            .await
+            .expect("head archived object");
+        assert_eq!(
+            archived_object.storage_class,
+            common::StorageClass::Cold as i32
+        );
+        assert_eq!(archived_object.tape_id.as_deref(), Some("TAPE-GRPC"));
+
+        let restore = backend
+            .restore_object("docs", "loop.txt", 2, common::RestoreTier::Standard)
+            .await
+            .expect("queue restore");
+        assert_eq!(restore.status_code, 202);
+
+        let recalled = recall_pending_once(loop_state).await.expect("recall once");
+        assert_eq!(recalled.restored_objects, 1);
+        assert_eq!(recalled.bytes_read, body.len() as u64);
+
+        let (object, restored) = backend
+            .get_object("docs", "loop.txt")
+            .await
+            .expect("get restored object from cache");
+        assert_eq!(
+            object.restore_status,
+            Some(common::RestoreStatus::RestoreCompleted as i32)
+        );
+        assert_eq!(restored, body);
+
+        let listed = raw_cache_client
+            .list_staging_keys(Request::new(ListStagingKeysRequest {
+                limit: 10,
+                after: None,
+            }))
+            .await
+            .expect("list staging after archive")
+            .into_inner();
+        assert!(listed.entries.is_empty());
 
         metadata_shutdown_tx.send(()).ok();
         cache_shutdown_tx.send(()).ok();

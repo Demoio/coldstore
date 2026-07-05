@@ -46,7 +46,7 @@ pub struct TapeServiceImpl {
 
 impl TapeServiceImpl {
     pub fn new(config: &TapeConfig) -> anyhow::Result<Self> {
-        let backend = SimulatorTapeBackend::from_config(config);
+        let backend = SimulatorTapeBackend::from_config(config)?;
         Ok(Self::new_with_backend(config.clone(), backend))
     }
 
@@ -137,9 +137,21 @@ impl SimulatorTapeBackend {
         }
     }
 
-    pub fn from_config(config: &TapeConfig) -> Self {
+    pub fn from_config(config: &TapeConfig) -> anyhow::Result<Self> {
         let drive_count = config.scsi.devices.len().max(1) as u32;
-        Self::new(8, drive_count)
+        let backend = Self::new(config.simulator.slot_count.max(1), drive_count);
+        for (index, tape_id) in config.simulator.tape_ids.iter().enumerate() {
+            let slot_id = format!("slot-{}", index + 1);
+            backend
+                .insert_tape(&slot_id, tape_id)
+                .map_err(|status| anyhow::anyhow!(status.message().to_string()))?;
+        }
+        if let Some(tape_id) = &config.simulator.autoload_tape_id {
+            backend
+                .load_tape(tape_id, "drive-0", None)
+                .map_err(|status| anyhow::anyhow!(status.message().to_string()))?;
+        }
+        Ok(backend)
     }
 
     pub fn insert_tape(&self, slot_id: &str, tape_id: &str) -> ServiceResult<()> {

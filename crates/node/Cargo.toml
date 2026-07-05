@@ -1,0 +1,24 @@
+[package]
+name = "coldstore-node"
+description = "ColdStore single-node runtime for local and small deployments"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "coldstore-node"
+path = "src/main.rs"
+
+[dependencies]
+coldstore-cache = { path = "../cache" }
+coldstore-common = { workspace = true }
+coldstore-gateway = { path = "../gateway" }
+coldstore-metadata = { path = "../metadata" }
+coldstore-scheduler = { path = "../scheduler" }
+coldstore-tape = { path = "../tape" }
+anyhow = { workspace = true }
+config = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

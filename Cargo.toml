@@ -8,6 +8,7 @@ members = [
     "crates/scheduler",
     "crates/cache",
     "crates/tape",
+    "crates/node",
     "crates/vtl",
 ]
 

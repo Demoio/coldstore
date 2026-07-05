@@ -64,6 +64,17 @@ impl MetadataServiceImpl {
         })
     }
 
+    #[cfg(feature = "metadata-raft")]
+    pub async fn new_with_snapshot_and_raft_backend(
+        config: &MetadataConfig,
+        snapshot_path: PathBuf,
+        raft_backend: Arc<crate::raft::RaftMetadataBackend>,
+    ) -> Result<Self> {
+        let mut service = Self::new_with_snapshot(config, snapshot_path).await?;
+        service.raft_backend = Some(raft_backend);
+        Ok(service)
+    }
+
     async fn persist_locked(&self, state: &MetadataState) -> std::result::Result<(), Status> {
         if let Some(path) = &self.snapshot_path {
             save_snapshot(path, state)

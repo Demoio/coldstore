@@ -322,6 +322,7 @@ fn grpc_status_to_s3_response(status: tonic::Status, resource: &str) -> Response
             };
             (code, StatusCode::NOT_FOUND)
         }
+        tonic::Code::FailedPrecondition => (S3ErrorCode::InvalidObjectState, StatusCode::FORBIDDEN),
         tonic::Code::Unimplemented => (S3ErrorCode::NotImplemented, StatusCode::NOT_IMPLEMENTED),
         _ => (S3ErrorCode::NotImplemented, StatusCode::BAD_GATEWAY),
     };
@@ -609,6 +610,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn failed_precondition_maps_to_invalid_object_state() {
+        let response = grpc_status_to_s3_response(
+            tonic::Status::failed_precondition("object must be restored"),
+            "/docs/readme.txt",
+        );
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("<Code>InvalidObjectState</Code>"));
     }
 
     #[tokio::test]

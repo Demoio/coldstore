@@ -1,0 +1,2 @@
+data_dir: data/single-node-no-tape
+tape_enabled: false
