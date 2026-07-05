@@ -107,7 +107,7 @@ impl LocalSingleNodeMetadataRaft {
         })
     }
 
-    pub fn propose(&self, command: MetadataCommand) -> Result<()> {
+    pub fn propose(&self, command: MetadataCommand) -> Result<u64> {
         let index = self.storage.log_entry_count()? + 1;
         self.storage.append_log_entry(index, 1, &command)?;
         let mut state_machine = self
@@ -119,11 +119,23 @@ impl LocalSingleNodeMetadataRaft {
             .map_err(|status| anyhow::anyhow!(status.to_string()))?;
         self.storage
             .save_state_machine_snapshot(state_machine.state())?;
-        Ok(())
+        Ok(index)
     }
 
     pub fn applied_log_count(&self) -> Result<u64> {
         self.storage.log_entry_count()
+    }
+
+    pub fn load_vote(&self) -> Result<Option<(u64, ColdStoreNodeId)>> {
+        self.storage.load_vote()
+    }
+
+    pub fn load_state_machine_snapshot(&self) -> Result<Option<MetadataState>> {
+        self.storage.load_state_machine_snapshot()
+    }
+
+    pub fn save_state_machine_snapshot(&self, state: &MetadataState) -> Result<()> {
+        self.storage.save_state_machine_snapshot(state)
     }
 
     pub fn snapshot(&self) -> Result<MetadataState> {
@@ -222,13 +234,17 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let node = LocalSingleNodeMetadataRaft::open(&dir).expect("open single node raft");
-        node.propose(MetadataCommand::CreateBucket(test_bucket("docs")))
+        let first_index = node
+            .propose(MetadataCommand::CreateBucket(test_bucket("docs")))
             .expect("propose create bucket");
-        node.propose(MetadataCommand::PutObject(test_object(
-            "docs",
-            "readme.txt",
-        )))
-        .expect("propose put object");
+        let second_index = node
+            .propose(MetadataCommand::PutObject(test_object(
+                "docs",
+                "readme.txt",
+            )))
+            .expect("propose put object");
+        assert_eq!(first_index, 1);
+        assert_eq!(second_index, 2);
         assert_eq!(node.applied_log_count().expect("applied count"), 2);
         drop(node);
 

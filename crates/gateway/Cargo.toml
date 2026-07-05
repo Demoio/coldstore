@@ -15,6 +15,7 @@ coldstore-common = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
+prost-types = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }

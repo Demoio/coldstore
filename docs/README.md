@@ -1,28 +1,40 @@
-# ColdStore 设计文档
+# ColdStore 文档总览
 
-## 文档索引
+本目录文档按“当前实现优先、目标设计分层保留”的原则重新整理。
 
-| 文档 | 说明 |
+## 当前权威文档
+
+| 文档 | 定位 |
 |------|------|
-| [DESIGN.md](./DESIGN.md) | **总架构设计** - 协议、元数据集群、缓存层、磁带层完整设计 |
-| [modules/](./modules/) | **模块设计** - 按架构分层拆分的独立设计文档 |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | 当前代码基线的组件、职责、联动关系、一致性边界 |
+| [DESIGN.md](./DESIGN.md) | 较完整的历史设计文档，包含目标态说明，部分内容可能超前于当前实现 |
+| [plans/](./plans/) | 阶段性实施计划与演进记录 |
 
 ## 模块设计文档
 
-| 模块 | 文档 |
-|------|------|
-| 接入层 | [01-access-layer.md](./modules/01-access-layer.md) |
-| 协议适配层 | [02-protocol-adapter.md](./modules/02-protocol-adapter.md) |
-| 元数据集群 | [03-metadata-cluster.md](./modules/03-metadata-cluster.md) |
-| 数据缓存层 | [04-cache-layer.md](./modules/04-cache-layer.md) |
-| 归档取回调度层 | [05-scheduler-layer.md](./modules/05-scheduler-layer.md) |
-| 磁带管理层 | [06-tape-layer.md](./modules/06-tape-layer.md) |
+[modules/](./modules/) 下的文档保留为分层设计参考。它们包含部分目标态内容，例如真实多节点 Raft、完整 SPDK、真实磁带库、Admin Console 和 OpenTelemetry 全量接入。
 
-## 设计要点摘要
+阅读优先级：
 
-- **协议**：兼容 S3 Glacier 冷归档协议（RestoreObject、x-amz-restore、取回层级）
-- **元数据**：[OpenRaft](https://github.com/databendlabs/openraft) + [openraft-rocksstore](https://crates.io/crates/openraft-rocksstore)，强一致性集群
-- **缓存**：[async-spdk](https://github.com/madsys-dev/async-spdk) 用户态 NVMe 缓存，原生 async/await
-- **磁带**：自研 SDK 抽象层，前期对接 Linux SCSI（st 驱动 + MTIO）
+1. 先读 [ARCHITECTURE.md](./ARCHITECTURE.md)，了解当前实现。
+2. 再读 [modules/README.md](./modules/README.md)，定位某个模块的目标设计。
+3. 涉及实现判断时，以 `crates/*/src` 和 `crates/proto/proto` 为准。
 
-详见 [DESIGN.md](./DESIGN.md) 与 [modules/README.md](./modules/README.md)。
+## 当前实现状态摘要
+
+| 组件 | 当前状态 |
+|------|----------|
+| Gateway | Axum S3 HTTP 网关，全部业务请求转发 Scheduler |
+| Scheduler | 业务编排中心，负责 PUT/GET/Restore/List、归档扫描、取回调度 |
+| Metadata | 单节点持久化状态机路径；多节点 `persistent_raft` 当前 fail-fast，避免伪集群 |
+| Cache | staging/restored 双区缓存，支持容量预算、restored 淘汰、staging 背压 |
+| Tape | TapeService 抽象与模拟/基础接口，真实设备集成仍是目标态 |
+| Proto | gRPC 契约已包含 `CompleteArchiveObject` 原子归档提交接口 |
+
+## 重要一致性约束
+
+- `Staging` 是写入路径数据，不允许被容量淘汰；超预算时必须背压。
+- `Restored` 是可重建缓存，可以按 LRU/LFU/TTL/容量回收。
+- Scheduler 归档完成必须通过 Metadata 的 `CompleteArchiveObject` 单命令提交，不能拆成多个无条件 RPC。
+- Metadata 当前默认单节点，默认 worker metadata 地址也为单节点。
+- 多节点 metadata 复制尚未完成，不能将 `persistent_raft` 多节点配置视为生产可用。

@@ -7,6 +7,7 @@ pub enum MetadataCommand {
     DeleteObject(DeleteObjectRequest),
     UpdateStorageClass(UpdateStorageClassRequest),
     UpdateArchiveLocation(UpdateArchiveLocationRequest),
+    CompleteArchiveObject(CompleteArchiveObjectRequest),
     UpdateRestoreStatus(UpdateRestoreStatusRequest),
     CreateBucket(common::BucketInfo),
     DeleteBucket(DeleteBucketRequest),

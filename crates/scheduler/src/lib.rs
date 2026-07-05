@@ -5,6 +5,9 @@ use coldstore_common::config::SchedulerConfig;
 use coldstore_proto::cache::cache_service_client::CacheServiceClient;
 use coldstore_proto::metadata::metadata_service_client::MetadataServiceClient;
 use coldstore_proto::tape::tape_service_client::TapeServiceClient;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{sleep, Duration};
 use tonic::transport::{Channel, Server};
 use tracing::{info, warn};
@@ -14,6 +17,12 @@ pub struct SchedulerState {
     pub cache: Option<CacheServiceClient<Channel>>,
     pub tape: Option<TapeServiceClient<Channel>>,
     pub config: SchedulerConfig,
+    pub active_archive_keys: Arc<Mutex<HashSet<String>>>,
+    pub active_recall_tasks: Arc<Mutex<HashSet<String>>>,
+    pub tape_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    pub archive_slots: Arc<Semaphore>,
+    pub recall_slots: Arc<Semaphore>,
+    pub recall_task_slots: Arc<Semaphore>,
 }
 
 pub async fn run(config: SchedulerConfig) -> Result<()> {
@@ -42,6 +51,12 @@ pub async fn run(config: SchedulerConfig) -> Result<()> {
         cache: Some(cache),
         tape,
         config: config.clone(),
+        active_archive_keys: Arc::new(Mutex::new(HashSet::new())),
+        active_recall_tasks: Arc::new(Mutex::new(HashSet::new())),
+        tape_locks: Arc::new(Mutex::new(HashMap::new())),
+        archive_slots: Arc::new(Semaphore::new(config.archive.max_workers.max(1))),
+        recall_slots: Arc::new(Semaphore::new(config.recall.max_workers.max(1))),
+        recall_task_slots: Arc::new(Semaphore::new(config.recall.max_concurrent_restores.max(1))),
     });
 
     service::spawn_background_loops(state.clone());

@@ -25,6 +25,7 @@ service MetadataService {
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc UpdateStorageClass(UpdateStorageClassRequest) returns (google.protobuf.Empty);
   rpc UpdateArchiveLocation(UpdateArchiveLocationRequest) returns (google.protobuf.Empty);
+  rpc CompleteArchiveObject(CompleteArchiveObjectRequest) returns (google.protobuf.Empty);
   rpc UpdateRestoreStatus(UpdateRestoreStatusRequest) returns (google.protobuf.Empty);
   rpc ScanColdPending(ScanColdPendingRequest) returns (ScanColdPendingResponse);
 
@@ -136,6 +137,19 @@ message UpdateArchiveLocationRequest {
   string tape_id = 4;
   repeated string tape_set = 5;
   uint64 tape_block_offset = 6;
+}
+
+message CompleteArchiveObjectRequest {
+  string bucket = 1;
+  string key = 2;
+  optional string version_id = 3;
+  optional uint64 expected_size = 4;
+  optional string expected_checksum = 5;
+  optional coldstore.common.StorageClass expected_storage_class = 6;
+  optional google.protobuf.Timestamp expected_updated_at = 7;
+  coldstore.common.ArchiveBundle bundle = 8;
+  uint64 tape_block_offset = 9;
+  coldstore.common.StorageClass storage_class = 10;
 }
 
 message UpdateRestoreStatusRequest {
